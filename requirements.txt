@@ -1,0 +1,6 @@
+ccxt==4.0.0          # Crypto API
+requests==2.31.0     # Forex API (Twelve Data)
+pandas==2.0.3        # Data Manipulation
+mplfinance==0.12.10b0 # Charting
+python-telegram-bot==20.0 # Notifications
+python-dotenv==1.0.0 # Config Management
