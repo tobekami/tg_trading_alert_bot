@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+  omni-sentinel:
+    build: .
+    container_name: omni_sentinel_bot
+    # The container will automatically restart if the Python script crashes or the VPS reboots
+    restart: unless-stopped
+
+    # Securely injects API keys at runtime without hardcoding them into the image
+    env_file:
+      - .env
+
+    # Volume mapping ensures the StateManager's memory vault survives container teardowns
+    volumes:
+      - ./data:/app/data  # Host data directory maps to container's internal state vault
+      - ./logs:/app/logs  # Host logs directory maps to container's internal log vault
+
+    # Isolates the bot within its own custom Docker network
+    networks:
+      - sentinel_net
+
+networks:
+  sentinel_net:
+    driver: bridge

@@ -1,0 +1,2572 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+.gitignore
+app/__init__.py
+app/bot.py
+app/config.py
+app/data_manager.py
+app/scanner.py
+app/state.py
+app/structure.py
+app/telegram_handler.py
+app/visualizer.py
+docker-compose.yml
+Dockerfile
+github/workflows/deploy.yml
+README.md
+requirements.txt
+tests/test_connect.py
+tests/test_data.py
+tests/test_ha_logic.py
+tests/test_scanner.py
+tests/test_state.py
+tests/test_structure.py
+tests/test_telegram.py
+tests/test_viz.py
+tests/test_watchlist.py
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="app/scanner.py">
+"""
+Purpose:
+    Analyzes live market data against historical L1/L2 structures to detect
+    Pivot Formations, Break of Structure (BOS), Reversals, and Equilibrium touches.
+    Utilizes a Sliding Window to track dynamic breakouts in real-time.
+"""
+from typing import List, Dict, Optional
+from app.structure import MarketStructureOrchestrator, Pivot
+from app.state import StateManager
+
+
+class PatternScanner:
+    def __init__(self, config: Dict):
+        """
+        Initializes the scanner with user-defined tracking rules.
+        Example Config:
+        {
+            "levels": [0.5, 0.75],
+            "alerts": {"bos": True, "reversal": True, "pivot": True}
+        }
+        """
+        self.config = config
+
+    def scan(self, symbol: str, current_candle: dict, candle_cache: List[dict],
+             orchestrator: MarketStructureOrchestrator,
+             newly_formed_l1: List[Pivot], newly_formed_l2: List[Pivot],
+             state_manager: StateManager) -> List[str]:
+        """
+        Purpose:
+            Runs all pattern checks on the current candle and returns a list of formatted alert strings.
+        """
+        alerts = []
+        alerts_config = self.config.get("alerts", {})
+        current_time = current_candle['timestamp'].timestamp() if hasattr(current_candle['timestamp'], 'timestamp') else \
+            current_candle['timestamp']
+
+        # Calculate live ATR for the Killzone buffer (using 1.0 multiplier as requested)
+        if len(candle_cache) >= 14:
+            recent_highs = [c['high'] for c in candle_cache[-14:]]
+            recent_lows = [c['low'] for c in candle_cache[-14:]]
+            current_atr = (sum(h - l for h, l in zip(recent_highs, recent_lows)) / 14.0) * 1.0
+        else:
+            current_atr = (current_candle['high'] - current_candle['low']) * 1.0
+
+        # --- 1. PIVOT FORMATION ALERTS ---
+        if alerts_config.get("pivot", True):
+            for p in newly_formed_l1:
+                p_type = "TOP" if p.type == 1 else "BOTTOM"
+                if not state_manager.has_pivot_triggered(symbol, f"L1_{p_type}", p.timestamp):
+                    alerts.append(f"🌟 L1 {p_type} Formed | {symbol} Price: {p.price:.4f}")
+                    state_manager.set_pivot_triggered(symbol, f"L1_{p_type}", p.timestamp)
+
+            for p in newly_formed_l2:
+                p_type = "TOP" if p.type == 1 else "BOTTOM"
+                if not state_manager.has_pivot_triggered(symbol, f"L2_{p_type}", p.timestamp):
+                    alerts.append(f"👑 L2 {p_type} Formed | {symbol} Price: {p.price:.4f}")
+                    state_manager.set_pivot_triggered(symbol, f"L2_{p_type}", p.timestamp)
+
+        # Extract the most recent confirmed L1 and L2 Pivots
+        last_l1_top = self._get_last_pivot(orchestrator.l1_logic.confirmed_pivots, type=1)
+        last_l1_bot = self._get_last_pivot(orchestrator.l1_logic.confirmed_pivots, type=-1)
+
+        last_l2_top = self._get_last_pivot(orchestrator.l2_logic.confirmed_pivots, type=1)
+        last_l2_bot = self._get_last_pivot(orchestrator.l2_logic.confirmed_pivots, type=-1)
+
+        if last_l1_top and last_l1_bot:
+            # --- 2. BREAK OF STRUCTURE (BOS) ---
+            if alerts_config.get("bos", True):
+                close_price = current_candle['close']
+                if close_price > last_l1_top.price:
+                    if not state_manager.has_bos_triggered(symbol, "L1_TOP", last_l1_top.timestamp):
+                        alerts.append(f"🚨 BOS (Bullish) | {symbol} closed above L1 Top at {last_l1_top.price:.4f}")
+                        state_manager.set_bos_triggered(symbol, "L1_TOP", last_l1_top.timestamp)
+                elif close_price < last_l1_bot.price:
+                    if not state_manager.has_bos_triggered(symbol, "L1_BOT", last_l1_bot.timestamp):
+                        alerts.append(f"🚨 BOS (Bearish) | {symbol} closed below L1 Bottom at {last_l1_bot.price:.4f}")
+                        state_manager.set_bos_triggered(symbol, "L1_BOT", last_l1_bot.timestamp)
+
+            # --- 3. THE KILLZONE GATEKEEPER & REVERSALS (Sliding Window) ---
+            if alerts_config.get("reversal", True):
+                active_levels = [0.0] + self.config.get("levels", [0.5, 0.75]) + [1.0]
+
+                structures_to_check = []
+                if last_l1_top and last_l1_bot:
+                    structures_to_check.append(("L1", last_l1_top, last_l1_bot))
+                if last_l2_top and last_l2_bot:
+                    structures_to_check.append(("L2", last_l2_top, last_l2_bot))
+
+                for struct_name, s_top, s_bot in structures_to_check:
+                    # Get the dynamic bounds for this specific structure
+                    range_high, range_low, is_bullish_leg, is_sliding = self._get_active_range(s_top, s_bot, orchestrator, current_candle)
+                    s_range = range_high - range_low
+
+                    for level in active_levels:
+                        # Determine target price and expected bounce direction
+                        if is_bullish_leg:
+                            # Pulling back DOWN from the top
+                            target_price = range_high - (s_range * level)
+                            expected_dir = "Bearish" if level == 0.0 else "Bullish"
+                        else:
+                            # Pulling back UP from the bottom
+                            target_price = range_low + (s_range * level)
+                            expected_dir = "Bullish" if level == 0.0 else "Bearish"
+
+                        # Check if inside this specific killzone
+                        if self._is_in_killzone(current_candle, target_price, current_atr):
+
+                            if level == 0.0:
+                                zone_label = "Range Top" if is_bullish_leg else "Range Bottom"
+                            elif level == 1.0:
+                                zone_label = "Range Bottom" if is_bullish_leg else "Range Top"
+                            else:
+                                zone_label = f"{level*100}% EQ"
+
+                            struct_label = f"Dynamic {struct_name}" if is_sliding else f"Static {struct_name}"
+                            active_zone_label = f"[{struct_label} {zone_label}]"
+
+                            # 1. Check Standard OHLC Reversal
+                            ohlc_reversal = self._check_reversal(symbol, candle_cache, expected_dir)
+                            if ohlc_reversal and state_manager.can_alert(symbol, f"OHLC_{struct_name}_{level}", current_time, cooldown_seconds=900):
+                                alerts.append(f"{ohlc_reversal} | {symbol} at {active_zone_label}")
+
+                            # 2. Check Heikin Ashi Reversal
+                            ha_cache = self._calculate_ha(candle_cache)
+                            is_bullish_bounce = (expected_dir == "Bullish")
+
+                            if self._check_ha_reversal(ha_cache, is_bullish_pullback=is_bullish_bounce):
+                                dir_icon = "🟢" if is_bullish_bounce else "🔴"
+                                if state_manager.can_alert(symbol, f"HA_{struct_name}_{level}", current_time, cooldown_seconds=900):
+                                    alerts.append(f"{dir_icon} HA Momentum {expected_dir} Shift | {symbol} at {active_zone_label}")
+
+                            break # Found our killzone, move to next structure
+
+        return alerts
+
+    def _get_active_range(self, last_top: Pivot, last_bot: Pivot, orchestrator: MarketStructureOrchestrator, current_candle: dict) -> tuple:
+        """
+        Solves the 'Broken Range' lag by implementing a Sliding Window.
+        Returns: (range_high, range_low, is_bullish_leg, is_sliding)
+        """
+        # Scan L0 minor swings for the absolute extreme prices since the confirmed pivots
+        max_high = current_candle['high']
+        for p in orchestrator.l1_logic.lower_tops:
+            if p.timestamp >= last_bot.timestamp and p.price > max_high:
+                max_high = p.price
+
+        min_low = current_candle['low']
+        for p in orchestrator.l1_logic.lower_bottoms:
+            if p.timestamp >= last_top.timestamp and p.price < min_low:
+                min_low = p.price
+
+        if last_top.timestamp > last_bot.timestamp:
+            # Sequence: Bottom -> Top (Upward Leg)
+            if max_high > last_top.price:
+                # Top broken! Sliding UP. Anchor the bottom.
+                return (max_high, last_bot.price, True, True)
+            elif min_low < last_bot.price:
+                # Bottom broken! Reversal. Sliding DOWN. Anchor the top.
+                return (last_top.price, min_low, False, True)
+            else:
+                # Static Range.
+                return (last_top.price, last_bot.price, True, False)
+        else:
+            # Sequence: Top -> Bottom (Downward Leg)
+            if min_low < last_bot.price:
+                # Bottom broken! Sliding DOWN. Anchor the top.
+                return (last_top.price, min_low, False, True)
+            elif max_high > last_top.price:
+                # Top broken! Reversal. Sliding UP. Anchor the bottom.
+                return (max_high, last_bot.price, True, True)
+            else:
+                # Static Range.
+                return (last_top.price, last_bot.price, False, False)
+
+    def _get_last_pivot(self, pivots: List[Pivot], type: int) -> Optional[Pivot]:
+        """Helper to iterate backwards and find the most recent Top (1) or Bottom (-1)."""
+        for p in reversed(pivots):
+            if p.type == type:
+                return p
+        return None
+
+    def _check_reversal(self, symbol: str, cache: List[dict], expected_dir: str) -> Optional[str]:
+        """
+        Evaluates the last 3 closed candles for engulfing reversal logic.
+        Strictly filters out reversals that don't match the expected structural direction.
+        """
+        if len(cache) < 3:
+            return None
+
+        # C1 = Oldest, C2 = Middle, C3 = Newest (Just closed)
+        c1, c2, c3 = cache[-3], cache[-2], cache[-1]
+
+        # BULLISH REVERSAL (Downtrend Reversal)
+        if expected_dir == "Bullish":
+            if c2['low'] < c1['low'] and c2['low'] < c3['low']:
+                # Relaxed: C3 just needs to close higher than C2's body
+                if c3['close'] > max(c2['open'], c2['close']):
+                    return f"🔄 Bullish Engulfing"
+
+        # BEARISH REVERSAL (Uptrend Reversal)
+        elif expected_dir == "Bearish":
+            if c2['high'] > c1['high'] and c2['high'] > c3['high']:
+                # Relaxed: C3 just needs to close lower than C2's body
+                if c3['close'] < min(c2['open'], c2['close']):
+                    return f"🔄 Bearish Engulfing"
+
+        return None
+
+    def _is_in_killzone(self, current_candle: dict, target_price: float, current_atr: float) -> bool:
+        """
+        Gatekeeper: Checks if the current candle's wicks touch the dynamic ATR zone around the target level.
+        """
+        upper_bound = target_price + current_atr
+        lower_bound = target_price - current_atr
+        return current_candle['low'] <= upper_bound and current_candle['high'] >= lower_bound
+
+    def _calculate_ha(self, cache: List[dict]) -> List[dict]:
+        """
+        Math Engine: Converts a rolling window of standard OHLC candles into Heikin Ashi format.
+        """
+        ha_cache = []
+        for i, c in enumerate(cache):
+            # HA Close is always the average of the current OHLC
+            ha_close = (c['open'] + c['high'] + c['low'] + c['close']) / 4.0
+
+            if i == 0:
+                ha_open = (c['open'] + c['close']) / 2.0
+            else:
+                # HA Open is the midpoint of the previous HA candle's body
+                prev_ha = ha_cache[i - 1]
+                ha_open = (prev_ha['open'] + prev_ha['close']) / 2.0
+
+            ha_high = max(c['high'], ha_open, ha_close)
+            ha_low = min(c['low'], ha_open, ha_close)
+
+            ha_cache.append({
+                "open": ha_open,
+                "high": ha_high,
+                "low": ha_low,
+                "close": ha_close,
+                "timestamp": c.get("timestamp")
+            })
+        return ha_cache
+
+    def _check_ha_reversal(self, ha_cache: List[dict], is_bullish_pullback: bool) -> bool:
+        """
+        Trigger: Evaluates the last 2 HA candles for Doji+Trend or Trend+Trend sequences.
+        """
+        if len(ha_cache) < 2:
+            return False
+
+        c2 = ha_cache[-2]
+        c3 = ha_cache[-1]
+
+        def is_doji(c):
+            body = abs(c['close'] - c['open'])
+            total = c['high'] - c['low']
+            # A Doji has a body less than or equal to 15% of its total range
+            return total > 0 and body <= (total * 0.15)
+
+        def is_green(c):
+            return c['close'] > c['open']
+
+        def is_red(c):
+            return c['close'] < c['open']
+
+        if is_bullish_pullback:
+            # We pulled back DOWN to the EQ, looking for a bounce UP (Green)
+            seq_a = is_doji(c2) and is_green(c3)
+            seq_b = is_green(c2) and is_green(c3) and not is_doji(c2)
+            return seq_a or seq_b
+        else:
+            # We pulled back UP to the EQ, looking for a rejection DOWN (Red)
+            seq_a = is_doji(c2) and is_red(c3)
+            seq_b = is_red(c2) and is_red(c3) and not is_doji(c2)
+            return seq_a or seq_b
+</file>
+
+<file path="app/state.py">
+"""
+Purpose:
+    Manages the persistence of bot state (Market Structures, Candle Caches, Alert Histories).
+    Ensures the bot can recover instantly from a crash without needing to re-process weeks of data.
+    Implements file backups to prevent corruption during unexpected shutdowns.
+"""
+import os
+import pickle
+import shutil
+from typing import Dict, List, Any
+from app.structure import MarketStructureOrchestrator
+
+
+class StateManager:
+    def __init__(self, filepath: str = "data/bot_state.pkl"):
+        self.filepath = filepath
+        self.backup_path = f"{filepath}.bak"
+
+        # Core memory schema
+        self.state = {
+            "orchestrators": {},  # type: Dict[str, MarketStructureOrchestrator]
+            "candle_caches": {},  # type: Dict[str, List[dict]]
+            "alert_states": {},  # type: Dict[str, float] -> Tracks timestamps for cooldowns
+            "bos_records": {},  # type: Dict[str, Any] -> Tracks processed BOS pivot timestamps
+            "pivot_records": {},  # type: Dict[str, Any] -> Tracks announced pivot formations
+            "watchlist": {}
+        }
+
+        # Ensure the data directory exists
+        os.makedirs(os.path.dirname(self.filepath), exist_ok=True)
+        self.load_state()
+
+    def load_state(self) -> None:
+        """
+        Purpose:
+            Loads the saved state from disk. If the main file is corrupted,
+            it attempts to recover from the backup file.
+        """
+        if not os.path.exists(self.filepath):
+            print("[ℹ️] No existing state found. Starting fresh.")
+            return
+
+        try:
+            with open(self.filepath, 'rb') as f:
+                self.state = pickle.load(f)
+            print(f"[💾] State loaded successfully from {self.filepath}")
+        except (EOFError, pickle.UnpicklingError) as e:
+            print(f"⚠️ Primary state file corrupted ({e}). Attempting to load backup...")
+            if os.path.exists(self.backup_path):
+                try:
+                    with open(self.backup_path, 'rb') as f:
+                        self.state = pickle.load(f)
+                    print(f"[💾] Backup state loaded successfully.")
+                except Exception as backup_error:
+                    print(f"❌ Backup also corrupted ({backup_error}). Starting fresh.")
+            else:
+                print("❌ No backup found. Starting fresh.")
+
+    def save_state(self) -> None:
+        """
+        Purpose:
+            Safely pickles the current memory to the disk. Creates a backup of the
+            old state before overwriting, preventing data loss if interrupted.
+        """
+        try:
+            # Create a backup of the existing file before overwriting
+            if os.path.exists(self.filepath):
+                shutil.copy(self.filepath, self.backup_path)
+
+            with open(self.filepath, 'wb') as f:
+                pickle.dump(self.state, f)
+        except Exception as e:
+            print(f"❌ Critical error saving state: {e}")
+
+    def get_orchestrator(self, symbol: str) -> MarketStructureOrchestrator:
+        """Retrieves or initializes the Orchestrator for a specific symbol."""
+        if symbol not in self.state["orchestrators"]:
+            self.state["orchestrators"][symbol] = MarketStructureOrchestrator()
+        return self.state["orchestrators"][symbol]
+
+    def update_candle_cache(self, symbol: str, new_candle: dict) -> List[dict]:
+        """
+        Purpose:
+            Maintains the rolling window. Max 150 candles.
+            If it hits 150, drops the oldest 50, keeping the newest 100.
+        """
+        if symbol not in self.state["candle_caches"]:
+            self.state["candle_caches"][symbol] = []
+
+        cache = self.state["candle_caches"][symbol]
+        cache.append(new_candle)
+
+        # 150/50 Wipe Logic
+        if len(cache) > 150:
+            self.state["candle_caches"][symbol] = cache[-101:]
+
+        return self.state["candle_caches"][symbol]
+
+    def can_alert(self, symbol: str, alert_type: str, current_time: float, cooldown_seconds: int = 900) -> bool:
+        """
+        Purpose:
+            Spam Protection. Checks if enough time has passed since the last alert of this type.
+            Default cooldown is 15 minutes (900 seconds).
+        """
+        key = f"{symbol}_{alert_type}"
+        last_alert_time = self.state["alert_states"].get(key, 0)
+
+        # FIX: Always allow if it has never alerted before (0), OR if the cooldown has passed.
+        if last_alert_time == 0 or (current_time - last_alert_time) >= cooldown_seconds:
+            self.state["alert_states"][key] = current_time
+            return True
+        return False
+
+    def has_bos_triggered(self, symbol: str, pivot_type: str, pivot_timestamp: float) -> bool:
+        """Checks if a Break of Structure has already been alerted for a specific pivot."""
+        if symbol not in self.state["bos_records"]:
+            self.state["bos_records"][symbol] = {}
+        return self.state["bos_records"][symbol].get(pivot_type) == pivot_timestamp
+
+    def set_bos_triggered(self, symbol: str, pivot_type: str, pivot_timestamp: float) -> None:
+        """Logs that a Break of Structure alert was sent for a specific pivot."""
+        if symbol not in self.state["bos_records"]:
+            self.state["bos_records"][symbol] = {}
+        self.state["bos_records"][symbol][pivot_type] = pivot_timestamp
+
+    def has_pivot_triggered(self, symbol: str, level: str, pivot_timestamp: float) -> bool:
+        """Checks if a Pivot Formation has already been announced for a specific timestamp."""
+        # Gracefully handle older state files that might not have this key yet
+        if "pivot_records" not in self.state:
+            self.state["pivot_records"] = {}
+
+        if symbol not in self.state["pivot_records"]:
+            self.state["pivot_records"][symbol] = {}
+
+        return self.state["pivot_records"][symbol].get(level) == pivot_timestamp
+
+    def set_pivot_triggered(self, symbol: str, level: str, pivot_timestamp: float) -> None:
+        """Logs that a Pivot Formation alert was sent to prevent duplicate announcements."""
+        if "pivot_records" not in self.state:
+            self.state["pivot_records"] = {}
+
+        if symbol not in self.state["pivot_records"]:
+            self.state["pivot_records"][symbol] = {}
+
+        self.state["pivot_records"][symbol][level] = pivot_timestamp
+
+    # --- Add these to your StateManager __init__ inside self.state ---
+    def get_watchlist(self) -> Dict[str, Any]:
+        """Returns the current dynamic watchlist."""
+        # Provide a default if it's completely empty on first boot
+        if "watchlist" not in self.state or not self.state["watchlist"]:
+            self.state["watchlist"] = {
+                "BTC/USDT": {"type": "crypto", "levels": [0.5, 0.75],
+                             "alerts": {"bos": True, "reversal": True, "pivot": False}},
+                "SOL/USDT": {"type": "crypto", "levels": [0.5, 0.75],
+                             "alerts": {"bos": True, "reversal": True, "pivot": True}},
+                "US30_USD": {"type": "forex", "levels": [0.5, 0.75],
+                             "alerts": {"bos": True, "reversal": False, "pivot": True}}
+            }
+        return self.state["watchlist"]
+
+    def add_symbol(self, symbol: str, market_type: str) -> bool:
+        """Adds a new symbol with default tracking settings."""
+        watchlist = self.get_watchlist()
+        if symbol in watchlist:
+            return False  # Already exists
+
+        watchlist[symbol] = {
+            "type": market_type,
+            "levels": [0.5],
+            "alerts": {"bos": True, "reversal": True, "pivot": False}
+        }
+        self.save_state()
+        return True
+
+    def remove_symbol(self, symbol: str) -> bool:
+        """Removes a symbol from the active scanner."""
+        watchlist = self.get_watchlist()
+        if symbol in watchlist:
+            del watchlist[symbol]
+            self.save_state()
+            return True
+        return False
+
+    def update_levels(self, symbol: str, levels: List[float]) -> bool:
+        """Updates the equilibrium tracking levels for a symbol."""
+        watchlist = self.get_watchlist()
+        if symbol in watchlist:
+            watchlist[symbol]["levels"] = levels
+            self.save_state()
+            return True
+        return False
+
+    def toggle_alert(self, symbol: str, alert_type: str) -> str:
+        """Toggles a specific alert on/off and returns the new state."""
+        watchlist = self.get_watchlist()
+        if symbol in watchlist and alert_type in watchlist[symbol]["alerts"]:
+            current_state = watchlist[symbol]["alerts"][alert_type]
+            new_state = not current_state
+            watchlist[symbol]["alerts"][alert_type] = new_state
+            self.save_state()
+            return "ON" if new_state else "OFF"
+        return "ERROR"
+</file>
+
+<file path="app/telegram_handler.py">
+"""
+Purpose:
+    The two-way Telegram CLI. Utilizes Interactive Inline Keyboards and State Machines
+    to provide a seamless, button-driven mobile UX.
+"""
+import logging
+import os
+import pandas as pd
+import psutil
+from typing import List
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    filters,
+    ContextTypes
+)
+from telegram.error import TelegramError
+
+from app.config import Config
+from app.state import StateManager
+from app.visualizer import Visualizer
+
+logger = logging.getLogger(__name__)
+
+
+class TelegramCLI:
+    """
+    Purpose:
+        Handles all inbound and outbound Telegram communications.
+        Implements a state machine to track multi-step user interactions (like adding a pair).
+    """
+
+    def __init__(self, state_manager: StateManager):
+        """
+        Initializes the CLI, hooks up the state manager, and registers command/callback routers.
+        """
+        self.state_manager = state_manager
+        self.chat_id = Config.TELEGRAM_CHAT_ID
+
+        # Initialize the Application with a post_init hook to push the native autocomplete Menu
+        self.app = Application.builder().token(Config.TELEGRAM_BOT_TOKEN).build()
+
+        # Command Routers (Standard /commands)
+        self.app.add_handler(CommandHandler("start", self.cmd_help))
+        self.app.add_handler(CommandHandler("help", self.cmd_help))
+        self.app.add_handler(CommandHandler("status", self.cmd_status))
+        self.app.add_handler(CommandHandler("add", self.cmd_add))
+        self.app.add_handler(CommandHandler("remove", self.cmd_remove))
+        self.app.add_handler(CommandHandler("levels", self.cmd_levels))
+        self.app.add_handler(CommandHandler("toggle", self.cmd_toggle))
+        self.app.add_handler(CommandHandler("chart", self.cmd_chart))
+        self.app.add_handler(CommandHandler("stats", self.cmd_stats))
+
+        # Interactive UI Routers (Button Clicks)
+        self.app.add_handler(CallbackQueryHandler(self.handle_button_click))
+
+        # Text Input Router (State Machine input capture, ignores commands)
+        self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text_input))
+
+    # --- OUTBOUND DISPATCHER ---
+    async def send_alert(self, message: str) -> None:
+        """
+        Purpose:
+            Called by the main loop to dispatch trading alerts to the user.
+        """
+        if not self.chat_id:
+            return
+
+        try:
+            await self.app.bot.send_message(
+                chat_id=self.chat_id,
+                text=message,
+                parse_mode='HTML',
+                disable_web_page_preview=True
+            )
+        except TelegramError as e:
+            logger.error(f"❌ Failed to send Telegram alert: {e}")
+
+    # --- UI HELPERS ---
+    def _get_watchlist_keyboard(self, action_prefix: str) -> InlineKeyboardMarkup:
+        """
+        Purpose:
+            Generates a dynamic inline keyboard based on the currently active watchlist.
+
+        Args:
+            action_prefix (str): The routing string prepended to the callback data.
+
+        Returns:
+            InlineKeyboardMarkup: The rendered Telegram keyboard object.
+        """
+        watchlist = self.state_manager.get_watchlist()
+        keyboard = []
+        for symbol in watchlist.keys():
+            # The callback_data max length is 64 bytes. Format: "prefix|composite_symbol"
+            keyboard.append([InlineKeyboardButton(f"📊 {symbol}", callback_data=f"{action_prefix}|{symbol}")])
+        return InlineKeyboardMarkup(keyboard)
+
+    # --- COMMANDS ---
+    async def cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        help_text = "🤖 <b>Omni-Market Sentinel</b>\n\nUse the blue <b>Menu</b> button below to navigate, or click a command:\n\n/status - View Active Watchlist\n/add - Track a new pair\n/chart - View a structure chart"
+        await update.message.reply_text(help_text, parse_mode='HTML')
+
+    async def cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        watchlist = self.state_manager.get_watchlist()
+        if not watchlist:
+            await update.message.reply_text("📭 Watchlist is currently empty.")
+            return
+
+        msg = "📊 <b>Active Watchlist:</b>\n\n"
+        for symbol, data in watchlist.items():
+            levels = ", ".join(str(l) for l in data['levels'])
+            alerts = data['alerts']
+            bos = "✅" if alerts['bos'] else "❌"
+            rev = "✅" if alerts['reversal'] else "❌"
+            piv = "✅" if alerts['pivot'] else "❌"
+
+            msg += (f"🔹 <b>{symbol}</b> ({data.get('type', 'crypto')})\n"
+                    f"   Levels: {levels}\n"
+                    f"   Alerts: BOS {bos} | Rev {rev} | Piv {piv}\n\n")
+
+        await update.message.reply_text(msg, parse_mode='HTML')
+
+    async def cmd_add(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        keyboard = [
+            [InlineKeyboardButton("🪙 Crypto", callback_data="add_type|crypto"),
+             InlineKeyboardButton("💱 Forex/Indices", callback_data="add_type|forex")]
+        ]
+        await update.message.reply_text("What type of market are you adding?", reply_markup=InlineKeyboardMarkup(keyboard))
+
+    async def cmd_remove(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self.state_manager.get_watchlist():
+            await update.message.reply_text("📭 Watchlist is empty.")
+            return
+        await update.message.reply_text("Select the pair to remove:", reply_markup=self._get_watchlist_keyboard("remove_exec"))
+
+    async def cmd_levels(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self.state_manager.get_watchlist():
+            await update.message.reply_text("📭 Watchlist is empty.")
+            return
+        await update.message.reply_text("Select the pair to update levels for:", reply_markup=self._get_watchlist_keyboard("levels_pair"))
+
+    async def cmd_toggle(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self.state_manager.get_watchlist():
+            await update.message.reply_text("📭 Watchlist is empty.")
+            return
+        await update.message.reply_text("Select the pair to toggle alerts for:", reply_markup=self._get_watchlist_keyboard("toggle_pair"))
+
+    async def cmd_chart(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self.state_manager.get_watchlist():
+            await update.effective_message.reply_text("📭 Watchlist is empty.")
+            return
+        await update.effective_message.reply_text("Select a pair to chart:", reply_markup=self._get_watchlist_keyboard("chart_exec"))
+
+    async def cmd_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        try:
+            process = psutil.Process(os.getpid())
+            ram_mb = process.memory_info().rss / (1024 * 1024)
+            cpu_usage = process.cpu_percent(interval=0.1)
+            last_loop_time = self.state_manager.state.get("last_loop_time", 0)
+            watchlist_size = len(self.state_manager.get_watchlist())
+            total_candles = sum(len(cache) for cache in self.state_manager.state.get("candle_caches", {}).values())
+
+            msg = (f"🖥️ <b>System Diagnostics</b>\n\n"
+                   f"🧠 <b>RAM Usage:</b> {ram_mb:.2f} MB\n"
+                   f"⚙️ <b>CPU Load:</b> {cpu_usage}%\n"
+                   f"⏱️ <b>Loop Latency:</b> {last_loop_time}s\n\n"
+                   f"🗃️ <b>Active Pairs:</b> {watchlist_size}\n"
+                   f"🗃️ <b>Cached Candles:</b> {total_candles}")
+            await update.message.reply_text(msg, parse_mode='HTML')
+        except Exception as e:
+            logger.error(f"Error fetching stats: {e}")
+            await update.message.reply_text("❌ Failed to retrieve system diagnostics.")
+
+
+    # --- THE BUTTON ROUTER ---
+    async def handle_button_click(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Purpose:
+            Catches all Inline Keyboard button presses and routes them to the correct logic
+            based on the action prefix.
+        """
+        query = update.callback_query
+        await query.answer()  # Acknowledge the button click to Telegram
+
+        try:
+            data = query.data.split("|")
+            action = data[0]
+
+            # STEP 1 of ADD: Type Selected -> Ask for Timeframe
+            if action == "add_type":
+                m_type = data[1]
+                keyboard = [
+                    [InlineKeyboardButton("3 min", callback_data=f"add_tf|{m_type}|3m"),
+                     InlineKeyboardButton("15 min", callback_data=f"add_tf|{m_type}|15m"),
+                     InlineKeyboardButton("1 hour", callback_data=f"add_tf|{m_type}|1h")],
+                    [InlineKeyboardButton("4 hour", callback_data=f"add_tf|{m_type}|4h"),
+                     InlineKeyboardButton("1 Day", callback_data=f"add_tf|{m_type}|1d")]
+                ]
+                await query.edit_message_text(f"Selected: {m_type.upper()}.\nNow choose the Timeframe:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+            # STEP 2 of ADD: Timeframe Selected -> Set State & Await Text Input
+            elif action == "add_tf":
+                m_type, tf = data[1], data[2]
+
+                # Update the state machine context
+                context.user_data['action'] = 'awaiting_add_symbol'
+                context.user_data['add_type'] = m_type
+                context.user_data['add_tf'] = tf
+
+                example = "BTC/USDT" if m_type == "crypto" else "US30_USD"
+                await query.edit_message_text(f"Almost done.\n\nPlease type the symbol you want to add.\n<i>Example: {example}</i>", parse_mode='HTML')
+
+            # REMOVE EXECUTION
+            elif action == "remove_exec":
+                symbol = data[1]
+                if self.state_manager.remove_symbol(symbol):
+                    await query.edit_message_text(f"🗑️ <b>{symbol}</b> removed from scanner.", parse_mode='HTML')
+
+            # TOGGLE: Pair Selected -> Ask for Alert Type
+            elif action == "toggle_pair":
+                symbol = data[1]
+                keyboard = [
+                    [InlineKeyboardButton("BOS", callback_data=f"toggle_exec|{symbol}|bos"),
+                     InlineKeyboardButton("Reversals", callback_data=f"toggle_exec|{symbol}|reversal"),
+                     InlineKeyboardButton("Pivots", callback_data=f"toggle_exec|{symbol}|pivot")]
+                ]
+                await query.edit_message_text(f"Toggle alerts for <b>{symbol}</b>:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+
+            # TOGGLE EXECUTION
+            elif action == "toggle_exec":
+                symbol, alert_type = data[1], data[2]
+                new_status = self.state_manager.toggle_alert(symbol, alert_type)
+                await query.edit_message_text(f"🔄 <b>{alert_type.upper()}</b> alerts for {symbol} are now <b>{new_status}</b>.", parse_mode='HTML')
+
+            # LEVELS: Pair Selected -> Set State & Await Text Input
+            elif action == "levels_pair":
+                symbol = data[1]
+                context.user_data['action'] = 'awaiting_levels'
+                context.user_data['level_symbol'] = symbol
+                await query.edit_message_text(f"Please type the new EQ levels for <b>{symbol}</b> separated by a comma.\n<i>Example: 0.5, 0.75</i>", parse_mode='HTML')
+
+            # CHART EXECUTION
+            elif action == "chart_exec":
+                symbol = data[1]
+                await query.message.delete() # Remove the menu to keep chat clean
+                await self._execute_chart(update.effective_message, symbol)
+
+        except Exception as e:
+            logger.error(f"Error handling button click: {e}")
+            await query.message.reply_text("❌ An error occurred processing your request.")
+
+    # --- THE TEXT INPUT ROUTER (State Machine) ---
+    async def handle_text_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Purpose:
+            Catches free-form text input and evaluates it against the current state machine action.
+        """
+        action = context.user_data.get('action')
+        text = update.message.text.upper().strip()
+
+        try:
+            # Handle Symbol Addition Execution
+            if action == 'awaiting_add_symbol':
+                m_type = context.user_data.get('add_type')
+                tf = context.user_data.get('add_tf')
+
+                # Construct the Composite Key!
+                composite_symbol = f"{text}:{tf}"
+
+                success = self.state_manager.add_symbol(composite_symbol, m_type)
+                if not success:
+                    await update.message.reply_text(f"⚠️ {composite_symbol} is already in the watchlist.")
+                else:
+                    # Persist the timeframe into the state config for the DataManager to use later
+                    watchlist = self.state_manager.get_watchlist()
+                    watchlist[composite_symbol]["timeframe"] = tf
+                    self.state_manager.save_state()
+
+                    status_msg = await update.message.reply_text(f"⏳ Downloading {tf} history for {composite_symbol}...")
+
+                    # --- Dynamic Pre-loader ---
+                    from app.data_manager import DataManager
+                    temp_dm = DataManager()
+
+                    if m_type == 'crypto':
+                        market_data = await temp_dm.fetch_mexc_crypto(text, timeframe=tf, limit=400)
+                    else:
+                        market_data = await temp_dm.fetch_oanda_forex(text, timeframe=tf, limit=400)
+
+                    if market_data is not None and not market_data.empty:
+
+                        # --- THE FIX: LIVE CANDLE GATEKEEPER ---
+                        # Drop the currently forming candle so the vault only learns from closed data
+                        current_time_naive = pd.Timestamp.now('UTC').tz_localize(None)
+                        market_data.index = pd.to_datetime(market_data.index).tz_localize(None)
+                        time_diff_seconds = (current_time_naive - market_data.index[-1]).total_seconds()
+
+                        tf_seconds_map = {'3m': 180, '15m': 900, '1h': 3600, '4h': 14400, '1d': 86400}
+                        required_duration = tf_seconds_map.get(tf, 180)
+
+                        if time_diff_seconds < required_duration:
+                            market_data = market_data.iloc[:-1]
+                        # ---------------------------------------
+
+                        orchestrator = self.state_manager.get_orchestrator(composite_symbol)
+                        cache = []
+
+                        for index, row in market_data.iterrows():
+                            current_candle = {
+                                "timestamp": index,
+                                "open": float(row['open']),
+                                "high": float(row['high']),
+                                "low": float(row['low']),
+                                "close": float(row['close'])
+                            }
+                            cache.append(current_candle)
+
+                            # Expand the ATR calculation for PEP 8 readability
+                            if len(cache) >= 14:
+                                recent_highs = [c['high'] for c in cache[-14:]]
+                                recent_lows = [c['low'] for c in cache[-14:]]
+                                current_atr = (sum(h - l for h, l in zip(recent_highs, recent_lows)) / 14.0) * 1.0
+                            else:
+                                current_atr = (current_candle['high'] - current_candle['low']) * 1.0
+
+                            orchestrator.process_candle(
+                                current_candle['high'],
+                                current_candle['low'],
+                                current_candle['timestamp'],
+                                current_atr
+                            )
+
+                        self.state_manager.state["candle_caches"][composite_symbol] = cache[-150:]
+                        self.state_manager.save_state()
+                        await status_msg.edit_text(f"✅ <b>{composite_symbol}</b> added and mapped! History loaded.", parse_mode='HTML')
+                    else:
+                        # Clean up failed additions
+                        self.state_manager.remove_symbol(composite_symbol)
+                        await status_msg.edit_text(f"❌ Error: Could not fetch data for {text} on {tf}. Removed from watchlist.")
+
+                # Clear State Machine
+                context.user_data.clear()
+
+            # Handle EQ Level Updates Execution
+            elif action == 'awaiting_levels':
+                symbol = context.user_data.get('level_symbol')
+                try:
+                    levels_float = [float(l.strip()) for l in text.split(',')]
+                    # Ensure levels are statistically valid percentages
+                    if not all(0 < l < 1 for l in levels_float):
+                        raise ValueError("Levels must be between 0 and 1.")
+
+                    if self.state_manager.update_levels(symbol, levels_float):
+                        await update.message.reply_text(f"✅ Levels for <b>{symbol}</b> updated to: {levels_float}", parse_mode='HTML')
+                    else:
+                        await update.message.reply_text(f"⚠️ {symbol} not found.")
+                except ValueError:
+                    await update.message.reply_text("❌ <b>Error:</b> Invalid format. Levels must be decimals between 0 and 1 separated by commas. (e.g. 0.5, 0.75)", parse_mode='HTML')
+
+                # Clear State Machine
+                context.user_data.clear()
+
+        except Exception as e:
+            logger.error(f"Error handling text input: {e}")
+            await update.message.reply_text("❌ An unexpected error occurred while processing your input.")
+            context.user_data.clear() # Reset state to prevent user lock-in
+
+    # --- HELPER LOGIC FOR CHARTING ---
+    async def _execute_chart(self, message, symbol: str):
+        """
+        Purpose:
+            Extracts the chart generation logic to keep the router clean.
+            Retrieves data, triggers the visualizer, and dispatches the PNG.
+        """
+        try:
+            cache = self.state_manager.state["candle_caches"].get(symbol)
+            if not cache or len(cache) < 5:
+                await message.reply_text(f"⚠️ Not enough data cached for <b>{symbol}</b> yet.", parse_mode='HTML')
+                return
+
+            status_msg = await message.reply_text(f"⏳ Generating structural chart for {symbol}...")
+
+            # Convert cache to DataFrame for mplfinance
+            df = pd.DataFrame(cache)
+            df.set_index('timestamp', inplace=True)
+
+            orchestrator = self.state_manager.get_orchestrator(symbol)
+            viz = Visualizer()
+
+            # Clean composite keys (e.g., BTC/USDT:15m -> BTC_USDT_15m) for safe file saving
+            safe_symbol = symbol.replace("/", "_").replace(":", "_")
+            filepath = f"data/{safe_symbol}_mobile.png"
+
+            os.makedirs('data', exist_ok=True)
+            viz.generate_static_chart(
+                df,
+                orchestrator.l1_logic.confirmed_pivots,
+                orchestrator.l2_logic.confirmed_pivots,
+                filepath
+            )
+
+            # Dispatch image and clean up local file
+            if os.path.exists(filepath):
+                with open(filepath, 'rb') as photo_file:
+                    await message.reply_photo(
+                        photo=photo_file,
+                        caption=f"📊 <b>{symbol}</b> Market Structure\n<i>(Static Mobile View)</i>",
+                        parse_mode='HTML'
+                    )
+                os.remove(filepath)
+                await status_msg.delete()
+            else:
+                await status_msg.edit_text(f"❌ Failed to generate chart image.")
+
+        except Exception as e:
+            logger.error(f"Error executing chart: {e}")
+            await message.reply_text("❌ An error occurred generating the chart.")
+</file>
+
+<file path="docker-compose.yml">
+version: '3.8'
+
+services:
+  omni-sentinel:
+    build: .
+    container_name: omni_sentinel_bot
+    # The container will automatically restart if the Python script crashes or the VPS reboots
+    restart: unless-stopped
+
+    # Securely injects API keys at runtime without hardcoding them into the image
+    env_file:
+      - .env
+
+    # Volume mapping ensures the StateManager's memory vault survives container teardowns
+    volumes:
+      - ./data:/app/data  # Host data directory maps to container's internal state vault
+      - ./logs:/app/logs  # Host logs directory maps to container's internal log vault
+
+    # Isolates the bot within its own custom Docker network
+    networks:
+      - sentinel_net
+
+networks:
+  sentinel_net:
+    driver: bridge
+</file>
+
+<file path="Dockerfile">
+# Use a lightweight official Python 3.11 runtime to optimize container size
+FROM python:3.11-slim
+
+# Create a non-root user for strict security and privilege dropping
+RUN adduser --disabled-password --gecos '' botuser
+
+# Set the active working directory inside the container
+WORKDIR /app
+
+# Set Python to run in unbuffered mode so print() statements appear in Docker logs instantly
+ENV PYTHONUNBUFFERED=1
+
+# Install system-level dependencies required for building C-extensions (pandas, ccxt)
+# Immediately clean up the apt cache to keep the image footprint minimal
+RUN apt-get update && apt-get install -y \
+    gcc \
+    python3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy only the requirements file first.
+# This heavily optimizes the Docker build cache so we don't redownload packages if only code changes.
+COPY requirements.txt .
+
+# Install Python dependencies without storing pip cache
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy the rest of the application source code into the container
+COPY . .
+
+# Create the specific directories needed for state persistence and logs.
+# Transfer ownership of the entire /app directory to our secure non-root user.
+RUN mkdir -p /app/data /app/logs && \
+    chown -R botuser:botuser /app
+
+# Switch context to the non-root user before executing the application
+USER botuser
+
+# The default command to spin up the Main Event Loop
+CMD ["python", "-m", "app.bot"]
+</file>
+
+<file path="github/workflows/deploy.yml">
+name: Deploy Omni-Market Sentinel
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  # --- STAGE 1: THE GATEKEEPER ---
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Pytest Suite
+        # Inject dummy variables so Config validation passes during automated testing
+        env:
+          OANDA_API_KEY: "ci_dummy_oanda_key"
+          TELEGRAM_BOT_TOKEN: "ci_dummy_bot_token"
+          TELEGRAM_CHAT_ID: "ci_dummy_chat_id"
+        run: |
+          pytest tests/ -v
+
+  # --- STAGE 2: PRODUCTION DEPLOYMENT ---
+  deploy:
+    needs: test # CRITICAL: This job will ONLY run if Stage 1 passes perfectly
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Secure SSH Deployment to Oracle VPS
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            cd ~/tg_trading_alert_bot
+            git pull origin main
+            docker-compose up -d --build
+            docker image prune -f
+</file>
+
+<file path="tests/test_connect.py">
+import sys
+import os
+import ccxt
+import requests
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from app.config import Config
+
+def test_mexc_connection():
+    mexc_config = {'enableRateLimit': True}
+    if Config.BINANCE_API_KEY and Config.BINANCE_SECRET:
+        mexc_config['apiKey'] = Config.BINANCE_API_KEY
+        mexc_config['secret'] = Config.BINANCE_SECRET
+
+    exchange = ccxt.mexc(mexc_config)
+    candles = exchange.fetch_ohlcv('BTC/USDT', timeframe='1m', limit=1)
+    
+    assert candles is not None, "Received None from MEXC."
+    assert len(candles[0]) == 6, "Received malformed data from MEXC."
+
+def test_oanda_connection():
+    # If it's the dummy CI key, skip the actual network request so the test passes in GitHub
+    if Config.OANDA_API_KEY == "ci_dummy_oanda_key":
+        return 
+
+    domain = "api-fxpractice.oanda.com" if Config.OANDA_ENV == "practice" else "api-fxtrade.oanda.com"
+    url = f"https://{domain}/v3/instruments/US30_USD/candles?granularity=M3&count=1"
+    headers = {"Authorization": f"Bearer {Config.OANDA_API_KEY}", "Accept-Datetime-Format": "UNIX"}
+
+    response = requests.get(url, headers=headers, timeout=10)
+    assert response.status_code == 200, f"OANDA rejected the request: {response.text}"
+    
+    data = response.json()
+    assert 'candles' in data and len(data['candles']) > 0, "Received unexpected JSON structure from OANDA."
+</file>
+
+<file path="tests/test_data.py">
+import sys
+import os
+import pytest
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from app.config import Config
+from app.data_manager import DataManager, SyncScheduler
+
+@pytest.mark.asyncio
+async def test_data_manager():
+    print("\n--- ⚡ Testing Phase 3: Data Manager & Async Scheduler ---")
+
+    Config.check_config()
+    manager = DataManager()
+
+    # We pass tuples now based on our Phase 4.5 MTF updates
+    fetch_requests = [
+        ("BTC/USDT:3m", "BTC/USDT", "crypto", "3m"),
+        ("US30_USD:3m", "US30_USD", "forex", "3m")
+    ]
+
+    try:
+        market_data = await manager.fetch_all_markets(fetch_requests, limit=5)
+
+        for composite_key, df in market_data.items():
+            assert not df.empty, f"DataFrame for {composite_key} is empty."
+            assert 'close' in df.columns, f"Missing OHLCV columns in {composite_key}"
+
+        # We skip testing the SyncScheduler clock in CI/CD so the pipeline doesn't hang for 3 minutes
+
+    finally:
+        await manager.close_connections()
+</file>
+
+<file path="tests/test_ha_logic.py">
+import sys
+import os
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from app.scanner import PatternScanner
+
+def test_heikin_ashi_and_killzone():
+    print("\n--- 🧠 Testing Phase 4: Heikin Ashi & ATR Killzone ---")
+    config = {"levels": [0.5, 0.75], "alerts": {"reversal": True}}
+    scanner = PatternScanner(config)
+
+    # 1. ATR Killzone
+    candle_in = {"low": 155.0, "high": 170.0}
+    candle_out = {"low": 165.0, "high": 175.0}
+    assert scanner._is_in_killzone(candle_in, 150.0, 10.0) is True, "Failed to detect price inside killzone."
+    assert scanner._is_in_killzone(candle_out, 150.0, 10.0) is False, "False positive outside killzone."
+
+    # 2. Heikin Ashi Math
+    ohlc_cache = [
+        {"open": 100, "high": 110, "low": 90, "close": 105},
+        {"open": 105, "high": 120, "low": 100, "close": 115}
+    ]
+    ha_cache = scanner._calculate_ha(ohlc_cache)
+    assert ha_cache[0]["close"] == 101.25, "HA Close math incorrect."
+
+    # 3. HA Reversal Sequences
+    ha_doji_green = [
+        {"open": 100, "high": 105, "low": 95, "close": 101},
+        {"open": 101, "high": 120, "low": 101, "close": 118}
+    ]
+    assert scanner._check_ha_reversal(ha_doji_green, is_bullish_pullback=True) is True, "Failed to detect HA sequence."
+</file>
+
+<file path="tests/test_scanner.py">
+import sys
+import os
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from app.scanner import PatternScanner
+from app.state import StateManager
+from app.structure import MarketStructureOrchestrator, Pivot
+
+
+def test_pattern_scanner():
+    print("\n--- 👁️ Testing Pattern Scanner ---")
+
+    test_file = "data/test_scanner_state.pkl"
+    if os.path.exists(test_file): os.remove(test_file)
+
+    try:
+        config = {"levels": [0.5], "alerts": {"bos": True, "reversal": True, "pivot": True}}
+        scanner = PatternScanner(config)
+        state = StateManager(filepath=test_file)
+        orchestrator = MarketStructureOrchestrator()
+        symbol = "BTC/USDT"
+
+        orchestrator.l1_logic.confirmed_pivots = [
+            Pivot(price=10000, timestamp=1, type=-1, level=1),
+            Pivot(price=20000, timestamp=2, type=1, level=1)
+        ]
+
+        # 1. BOS One-Shot Logic
+        candle_1 = {"timestamp": 3, "open": 19000, "high": 21000, "low": 19000, "close": 20500}
+        alerts_1 = scanner.scan(symbol, candle_1, [], orchestrator, [], [], state)
+
+        candle_2 = {"timestamp": 4, "open": 20500, "high": 21500, "low": 20000, "close": 21000}
+        alerts_2 = scanner.scan(symbol, candle_2, [], orchestrator, [], [], state)
+
+        assert any("BOS" in a for a in alerts_1), "Failed to detect initial BOS."
+        assert not any("BOS" in a for a in alerts_2), "Failed to suppress redundant BOS alert."
+
+        # 2. Equilibrium Touch
+        candle_3 = {"timestamp": 5, "open": 16000, "high": 16000, "low": 14000, "close": 14500}
+        alerts_3 = scanner.scan(symbol, candle_3, [], orchestrator, [], [], state)
+        assert any("Equilibrium Touch" in a for a in alerts_3) or any(
+            "EQ" in a for a in alerts_3), "Failed to detect EQ touch."
+
+    finally:
+        if os.path.exists(test_file): os.remove(test_file)
+        if os.path.exists(f"{test_file}.bak"): os.remove(f"{test_file}.bak")
+</file>
+
+<file path="tests/test_state.py">
+import sys
+import os
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from app.state import StateManager
+
+def test_state_manager():
+    print("\n--- 🧠 Testing State Manager ---")
+    test_file = "data/test_state.pkl"
+    if os.path.exists(test_file): os.remove(test_file)
+
+    try:
+        state = StateManager(filepath=test_file)
+        symbol = "TEST/USDT"
+
+        # 1. Rolling Cache
+        for i in range(155):
+            cache = state.update_candle_cache(symbol, {"close": i})
+            if i == 149: assert len(cache) == 150
+            elif i == 150: assert len(cache) == 101
+
+        # 2. Alert Cooldowns
+        assert state.can_alert(symbol, "EQ_0.5", 1000, 900) is True
+        assert state.can_alert(symbol, "EQ_0.5", 1010, 900) is False
+        assert state.can_alert(symbol, "EQ_0.5", 1905, 900) is True
+
+        # 3. Persistence
+        state.save_state()
+        assert os.path.exists(test_file)
+        new_state = StateManager(filepath=test_file)
+        assert len(new_state.state["candle_caches"][symbol]) == 105
+
+    finally:
+        if os.path.exists(test_file): os.remove(test_file)
+        if os.path.exists(f"{test_file}.bak"): os.remove(f"{test_file}.bak")
+</file>
+
+<file path="tests/test_structure.py">
+import sys
+import os
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from app.structure import MarketStructureOrchestrator
+
+def test_neurotrader_logic():
+    print("\n--- 🧠 Testing Phase 1: Core Logic ---")
+    orchestrator = MarketStructureOrchestrator()
+    atr_threshold = 1.0
+
+    synthetic_candles = [
+        [1, 10, 9], [2, 12, 11], [3, 10, 9], [4, 8, 7], [5, 10, 9],
+        [6, 14, 13], [7, 12, 11], [8, 9, 8], [9, 11, 10],
+        [10, 11, 10], [11, 9, 8], [12, 6, 5], [13, 9, 8],
+    ]
+
+    l0_count = 0
+    l1_count = 0
+
+    for candle in synthetic_candles:
+        timestamp, high, low = candle
+        l0, l1, l2 = orchestrator.process_candle(high=high, low=low, timestamp=timestamp, atr=atr_threshold)
+        if l0: l0_count += 1
+        if l1: l1_count += len(l1)
+
+    assert l0_count == 6, f"Expected 6 L0 Pivots, but got {l0_count}"
+    assert l1_count == 1, f"Expected 1 L1 Pivot, but got {l1_count}"
+</file>
+
+<file path="tests/test_telegram.py">
+import sys
+import os
+import pytest
+from unittest.mock import AsyncMock, MagicMock, patch
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from app.state import StateManager
+from app.telegram_handler import TelegramCLI
+
+
+@pytest.mark.asyncio
+async def test_telegram_logic():
+    print("\n--- 📱 Testing Telegram CLI & Command Validator ---")
+
+    # Cleanup before test
+    if os.path.exists("data/test_tg_state.pkl"): os.remove("data/test_tg_state.pkl")
+    if os.path.exists("data/test_tg_state.pkl.bak"): os.remove("data/test_tg_state.pkl.bak")
+
+    try:
+        state = StateManager(filepath="data/test_tg_state.pkl")
+
+        with patch('app.telegram_handler.Application.builder') as mock_builder:
+            cli = TelegramCLI(state)
+
+        update = MagicMock()
+        update.message = AsyncMock()
+        context = MagicMock()
+
+        # 1. Test Valid /add Command
+        context.args = ["ADA/USDT", "crypto"]
+        await cli.cmd_add(update, context)
+        update.message.reply_text.assert_called()
+        reply_args = update.message.reply_text.call_args[0][0]
+        assert "✅" in reply_args, "Did not get success message for valid addition."
+        assert "ADA/USDT" in state.get_watchlist(), "State was not updated by Telegram CLI."
+
+        # 2. Test Invalid /add Command
+        context.args = ["ADA/USDT"]
+        await cli.cmd_add(update, context)
+        reply_args = update.message.reply_text.call_args[0][0]
+        assert "❌ <b>Error:</b>" in reply_args, "Did not catch missing argument error."
+
+        # 3. Test Invalid /levels Command
+        context.args = ["ADA/USDT", "half, quarter"]
+        await cli.cmd_levels(update, context)
+        reply_args = update.message.reply_text.call_args[0][0]
+        assert "❌ <b>Error:</b>" in reply_args, "Did not catch float conversion error."
+        assert state.get_watchlist()["ADA/USDT"]["levels"] == [0.5], "Levels were corrupted by bad input."
+
+    finally:
+        # Cleanup after test finishes or fails
+        if os.path.exists("data/test_tg_state.pkl"): os.remove("data/test_tg_state.pkl")
+        if os.path.exists("data/test_tg_state.pkl.bak"): os.remove("data/test_tg_state.pkl.bak")
+</file>
+
+<file path="tests/test_viz.py">
+import sys
+import os
+import ccxt
+import pandas as pd
+import numpy as np
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from app.structure import MarketStructureOrchestrator
+from app.visualizer import Visualizer
+
+
+def test_visualization():
+    print("\n--- 👁️ Testing Phase 2: Dual Visualization Engine ---")
+    html_path = 'logs/plots/debug_chart.html'
+    png_path = 'logs/plots/mobile_chart.png'
+
+    # Cleanup before test
+    if os.path.exists(html_path): os.remove(html_path)
+    if os.path.exists(png_path): os.remove(png_path)
+
+    try:
+        exchange = ccxt.mexc({'enableRateLimit': True})
+        candles = exchange.fetch_ohlcv('BTC/USDT', timeframe='15m', limit=150)
+
+        df = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        df.set_index('timestamp', inplace=True)
+        df['atr'] = 100.0  # Mock ATR for speed
+
+        orchestrator = MarketStructureOrchestrator()
+        l0_col, l1_col, l2_col = [], [], []
+
+        for index, row in df.iterrows():
+            l0, l1, l2 = orchestrator.process_candle(row['high'], row['low'], index, row['atr'] * 0.5)
+            if l0: l0_col.append(l0)
+            if l1: l1_col.extend(l1)
+            if l2: l2_col.extend(l2)
+
+        os.makedirs('logs/plots', exist_ok=True)
+        viz = Visualizer()
+
+        viz.generate_html_chart(df, l0_col, l1_col, l2_col, save_path=html_path)
+        viz.generate_static_chart(df, l1_col, l2_col, save_path=png_path)
+
+        assert os.path.exists(html_path), "HTML chart failed to generate."
+        assert os.path.exists(png_path), "Static PNG failed to generate."
+
+    finally:
+        if os.path.exists(html_path): os.remove(html_path)
+        if os.path.exists(png_path): os.remove(png_path)
+</file>
+
+<file path="tests/test_watchlist.py">
+import sys
+import os
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from app.state import StateManager
+
+def test_dynamic_watchlist():
+    print("\n--- 🧠 Testing Dynamic Watchlist (State Manager) ---")
+    test_file = "data/test_watchlist_state.pkl"
+    if os.path.exists(test_file): os.remove(test_file)
+
+    try:
+        state = StateManager(filepath=test_file)
+
+        # 1. Addition
+        assert state.add_symbol("SOL/USDT", "crypto") is True
+        assert "SOL/USDT" in state.get_watchlist()
+        assert state.add_symbol("SOL/USDT", "crypto") is False # Duplicate
+
+        # 2. Levels
+        assert state.update_levels("SOL/USDT", [0.382, 0.618]) is True
+        assert state.get_watchlist()["SOL/USDT"]["levels"] == [0.382, 0.618]
+
+        # 3. Toggles
+        assert state.toggle_alert("SOL/USDT", "bos") == "OFF"
+        assert state.get_watchlist()["SOL/USDT"]["alerts"]["bos"] is False
+
+        # 4. Removal
+        assert state.remove_symbol("SOL/USDT") is True
+        assert "SOL/USDT" not in state.get_watchlist()
+
+    finally:
+        if os.path.exists(test_file): os.remove(test_file)
+        if os.path.exists(f"{test_file}.bak"): os.remove(f"{test_file}.bak")
+</file>
+
+<file path=".gitignore">
+# Python
+__pycache__/
+*.py[cod]
+*.class
+
+# Virtual Environment
+venv/
+env/
+
+# Environment Variables
+.env
+
+# Logs and Data
+logs/
+data/
+*.log
+*.png
+
+# IDEs
+.vscode/
+.idea/
+</file>
+
+<file path="app/bot.py">
+"""
+Purpose:
+    The Main Event Loop. Orchestrates concurrent execution of the
+    Telegram CLI (listening) and the Market Scanner (processing).
+    Fully upgraded for Phase 4.5 to support Multi-Timeframe (MTF) Composite Keys.
+"""
+import asyncio
+import logging
+import pandas as pd
+import time
+from typing import List, Tuple
+
+from app.data_manager import DataManager, SyncScheduler
+from app.state import StateManager
+from app.structure import MarketStructureOrchestrator
+from app.scanner import PatternScanner
+from app.telegram_handler import TelegramCLI
+
+# Configure production-grade logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+logger = logging.getLogger(__name__)
+
+# --- HIDE TELEGRAM NETWORK SPAM ---
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
+
+class OmniMarketSentinel:
+    """
+    Purpose:
+        The central nervous system of the bot. Manages state, triggers data fetching,
+        routes data through the structural brain, and dispatches alerts.
+    """
+
+    def __init__(self):
+        """
+        Initializes the Core Managers and the Telegram User Interface.
+        """
+        self.state_manager = StateManager()
+        self.data_manager = DataManager()
+        self.telegram = TelegramCLI(self.state_manager)
+
+        # Mapping for dynamic live-candle dropping based on timeframe duration
+        self.tf_seconds_map = {
+            '3m': 180,
+            '15m': 900,
+            '1h': 3600,
+            '4h': 14400,
+            '1d': 86400
+        }
+
+    async def preload_history(self) -> None:
+        """
+        Purpose:
+            Fetches 400 historical candles on startup to build accurate L1/L2 structures.
+            Now utilizes the Composite Key architecture (Symbol:Timeframe).
+        """
+        watchlist = self.state_manager.get_watchlist()
+        fetch_requests: List[Tuple[str, str, str, str]] = []
+
+        # 1. Build the Composite Fetch Requests
+        for composite_key, cfg in watchlist.items():
+            # Fallback for old save files that might not have the colon formatting yet
+            symbol = composite_key.split(':')[0] if ':' in composite_key else composite_key
+            m_type = cfg.get("type", "crypto")
+            tf = cfg.get("timeframe", "3m")
+
+            fetch_requests.append((composite_key, symbol, m_type, tf))
+
+        if not fetch_requests:
+            return
+
+        logger.info("⏳ Pre-loading 400 historical candles to build Market Structure...")
+
+        # 2. Fetch the data using the Phase 4.5 signature
+        market_data = await self.data_manager.fetch_all_markets(fetch_requests, limit=400)
+
+        # 3. Process the historical data per Composite Key
+        for composite_key, df in market_data.items():
+            if df.empty:
+                continue
+
+            # --- THE MEMORY WIPE FIX ---
+            # Prevents time-overlap corruption on restart by cleanly wiping the old orchestrator
+            self.state_manager.state["orchestrators"][composite_key] = MarketStructureOrchestrator()
+
+            orchestrator = self.state_manager.get_orchestrator(composite_key)
+            cache = []
+
+            # Push all historical candles through the Brain Vault sequentially
+            for index, row in df.iterrows():
+                current_candle = {
+                    "timestamp": index,
+                    "open": float(row['open']),
+                    "high": float(row['high']),
+                    "low": float(row['low']),
+                    "close": float(row['close'])
+                }
+                cache.append(current_candle)
+
+                # Calculate historical ATR dynamically
+                if len(cache) >= 14:
+                    recent_highs = [c['high'] for c in cache[-14:]]
+                    recent_lows = [c['low'] for c in cache[-14:]]
+                    current_atr = (sum(h - l for h, l in zip(recent_highs, recent_lows)) / 14.0) * 1.0
+                else:
+                    current_atr = (current_candle['high'] - current_candle['low']) * 1.0
+
+                orchestrator.process_candle(
+                    current_candle['high'],
+                    current_candle['low'],
+                    current_candle['timestamp'],
+                    current_atr
+                )
+
+            # Cap the memory vault to the most recent 150 candles
+            self.state_manager.state["candle_caches"][composite_key] = cache[-150:]
+            logger.info(f"   -> ✅ {composite_key} Structure mapped.")
+
+        self.state_manager.save_state()
+        logger.info("🧠 Brain Vault initialized with historical MTF data.")
+
+    async def trading_loop(self) -> None:
+        """
+        Purpose:
+            The 24/7 background loop that scans markets.
+            Wakes up every 3 minutes, but dynamically processes higher timeframes
+            only when their respective candles actually close.
+        """
+        logger.info("📈 Trading Loop active. Syncing to clock...")
+
+        while True:
+            try:
+                # Sync to the global 3-minute heartbeat
+                await SyncScheduler.sleep_until_next_candle(interval_minutes=3)
+                logger.info("⚡ Processing markets...")
+
+                # --- START THE STOPWATCH ---
+                start_time = time.perf_counter()
+
+                # 1. Pull the dynamic watchlist and build requests
+                watchlist = self.state_manager.get_watchlist()
+                fetch_requests: List[Tuple[str, str, str, str]] = []
+
+                for composite_key, cfg in watchlist.items():
+                    symbol = composite_key.split(':')[0] if ':' in composite_key else composite_key
+                    m_type = cfg.get("type", "crypto")
+                    tf = cfg.get("timeframe", "3m")
+                    fetch_requests.append((composite_key, symbol, m_type, tf))
+
+                # Skip iteration if watchlist was cleared via Telegram
+                if not fetch_requests:
+                    logger.info("📭 Watchlist empty. Waiting for Telegram commands...")
+                    continue
+
+                # 2. Fetch Data (limit=150 for catch-up recovery)
+                market_data = await self.data_manager.fetch_all_markets(fetch_requests, limit=150)
+                all_alerts = []
+
+                # 3. Process Symbols
+                for composite_key, df in market_data.items():
+                    if df.empty:
+                        continue
+
+                    config = watchlist[composite_key]
+                    tf = config.get("timeframe", "3m")
+                    scanner = PatternScanner(config)
+                    orchestrator = self.state_manager.get_orchestrator(composite_key)
+
+                    # --- THE BATCH CATCH-UP LOGIC ---
+                    candle_cache = self.state_manager.state.get("candle_caches", {}).get(composite_key, [])
+                    if candle_cache:
+                        last_cache_time = pd.to_datetime(candle_cache[-1]['timestamp']).tz_localize(None)
+                    else:
+                        last_cache_time = pd.to_datetime(0).tz_localize(None)
+
+                    current_time_naive = pd.Timestamp.now('UTC').tz_localize(None)
+                    df.index = pd.to_datetime(df.index).tz_localize(None)
+
+                    time_diff_seconds = (current_time_naive - df.index[-1]).total_seconds()
+
+                    # --- DYNAMIC TIMEFRAME GATEKEEPER ---
+                    # Drops the currently forming candle based on its specific timeframe length
+                    required_duration = self.tf_seconds_map.get(tf, 180)
+                    if time_diff_seconds < required_duration:
+                        df_closed = df.iloc[:-1]
+                    else:
+                        df_closed = df
+
+                    # Isolate missing candles that closed AFTER our last saved cache time
+                    new_candles = df_closed[df_closed.index > last_cache_time]
+
+                    if new_candles.empty:
+                        continue
+
+                    # Accumulators for this specific cycle
+                    batch_l1_pivots = []
+                    batch_l2_pivots = []
+
+                    # Process the missing gap sequentially
+                    for idx, row in new_candles.iterrows():
+                        current_candle = {
+                            "timestamp": idx,
+                            "open": float(row['open']),
+                            "high": float(row['high']),
+                            "low": float(row['low']),
+                            "close": float(row['close'])
+                        }
+
+                        current_cache = self.state_manager.update_candle_cache(composite_key, current_candle)
+
+                        # Calculate 14-period ATR
+                        if len(current_cache) >= 14:
+                            recent_highs = [c['high'] for c in current_cache[-14:]]
+                            recent_lows = [c['low'] for c in current_cache[-14:]]
+                            current_atr = (sum(h - l for h, l in zip(recent_highs, recent_lows)) / 14.0) * 1.0
+                        else:
+                            current_atr = (current_candle['high'] - current_candle['low']) * 1.0
+
+                        # Feed into Brain Vault
+                        l0, l1_list, l2_list = orchestrator.process_candle(
+                            current_candle['high'],
+                            current_candle['low'],
+                            current_candle['timestamp'],
+                            current_atr
+                        )
+
+                        if l1_list: batch_l1_pivots.extend(l1_list)
+                        if l2_list: batch_l2_pivots.extend(l2_list)
+
+                        # Scan for alerts ONLY on the absolute newest (last) candle in the catch-up batch
+                        if idx == new_candles.index[-1]:
+                            symbol_alerts = scanner.scan(
+                                composite_key,  # Pass the composite key so alerts show the timeframe
+                                current_candle,
+                                current_cache,
+                                orchestrator,
+                                batch_l1_pivots,
+                                batch_l2_pivots,
+                                self.state_manager
+                            )
+
+                            logger.info(f"   -> {composite_key} analyzed. Current Close: {current_candle['close']}")
+
+                            if symbol_alerts:
+                                all_alerts.extend([f"<b>{composite_key}</b> | {a}" for a in symbol_alerts])
+
+                # 4. Dispatch Alerts & Save State
+                for alert in all_alerts:
+                    await self.telegram.send_alert(alert)
+
+                self.state_manager.save_state()
+
+                # --- STOP THE STOPWATCH & SAVE THE TIME ---
+                end_time = time.perf_counter()
+                loop_duration = round(end_time - start_time, 2)
+                self.state_manager.state["last_loop_time"] = loop_duration
+                logger.info(f"⏱️ Cycle completed in {loop_duration}s")
+
+            except Exception as e:
+                # Catch-all to prevent a single bad iteration from killing the 24/7 background loop
+                logger.error(f"❌ Critical error in trading loop: {e}", exc_info=True)
+                await asyncio.sleep(10) # Brief pause before attempting the next cycle
+
+    async def run_concurrently(self) -> None:
+        """
+        Purpose:
+            Initializes the Telegram bot and runs the trading loop alongside it asynchronously.
+        """
+        logger.info("🚀 Omni-Market Sentinel Starting...")
+
+        # Start Telegram Application internals
+        await self.telegram.app.initialize()
+        await self.telegram.app.start()
+        await self.telegram.app.updater.start_polling()
+
+        logger.info("📱 Telegram CLI Online. Type /help in your chat.")
+
+        # Load historical L1/L2 structures
+        await self.preload_history()
+
+        # Create the background task for the trading scanner
+        trading_task = asyncio.create_task(self.trading_loop())
+
+        try:
+            # Keep the main thread alive indefinitely
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            logger.info("🛑 Shutting down...")
+        finally:
+            trading_task.cancel()
+            await self.telegram.app.updater.stop()
+            await self.telegram.app.stop()
+            await self.telegram.app.shutdown()
+            await self.data_manager.close_connections()
+
+if __name__ == "__main__":
+    bot = OmniMarketSentinel()
+    try:
+        asyncio.run(bot.run_concurrently())
+    except KeyboardInterrupt:
+        print("\n[ℹ️] Manual interrupt received. Exiting.")
+</file>
+
+<file path="app/config.py">
+"""
+Purpose:
+    Loads and validates environment variables from the .env file.
+    This acts as the central configuration hub for the bot.
+
+Returns:
+    Config (class): A class containing all validated configuration variables.
+
+Example:
+    from app.config import Config
+    print(Config.TWELVE_DATA_KEY)
+"""
+import os
+from dotenv import load_dotenv
+
+# We use os.path to dynamically locate the .env file in the parent directory.
+# This ensures the bot can be run from any working directory without path errors.
+try:
+    dotenv_path = os.path.join(os.path.dirname(__file__), '..', '.env')
+    load_dotenv(dotenv_path=dotenv_path)
+except Exception as e:
+    # Catch generic exceptions in case of strict permission errors reading the file
+    print(f"Warning: Could not load .env file directly. Relying on system environment variables. Error: {e}")
+
+
+class Config:
+    # Binance Keys (Optional)
+    # Why: Binance allows public market data fetching (like candles) without an API key.
+    # Rate limits for public endpoints are tracked by IP address, allowing a generous 6,000 request weight per minute, which easily covers our needs.
+    BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", None)
+    BINANCE_SECRET = os.getenv("BINANCE_SECRET", None)
+
+    # OANDA (Required for Forex/Indices)
+    OANDA_API_KEY = os.getenv("OANDA_API_KEY")
+    # 'practice' routes to api-fxpractice.oanda.com, 'live' routes to api-fxtrade.oanda.com
+    OANDA_ENV = os.getenv("OANDA_ENV", "practice")
+
+    # Telegram (Required for Alerts)
+    TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+    TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+    @classmethod
+    def check_config(cls) -> None:
+        """
+        Purpose:
+            Validates that all mandatory environment variables are set.
+            Raises an error immediately on startup if keys are missing, preventing runtime crashes.
+
+        Args:
+            None
+
+        Returns:
+            None
+
+        Raises:
+            EnvironmentError: If TWELVE_DATA_KEY, TELEGRAM_BOT_TOKEN, or TELEGRAM_CHAT_ID are missing.
+
+        Example:
+            Config.check_config() # Will raise EnvironmentError if .env is incomplete
+        """
+        missing = []
+
+        # We only check for Twelve Data and Telegram because Binance keys are optional for our public data use case.
+        if not cls.OANDA_API_KEY:
+            missing.append("OANDA_API_KEY")
+        if not cls.TELEGRAM_BOT_TOKEN:
+            missing.append("TELEGRAM_BOT_TOKEN")
+        if not cls.TELEGRAM_CHAT_ID:
+            missing.append("TELEGRAM_CHAT_ID")
+
+        if missing:
+            raise EnvironmentError(f"CRITICAL: Missing required .env variables: {', '.join(missing)}")
+</file>
+
+<file path="app/data_manager.py">
+"""
+Purpose:
+    Manages all data retrieval, processing, and scheduling for the bot.
+    Uses asynchronous programming (asyncio.to_thread) to fetch from multiple APIs concurrently.
+    Supports dynamic timeframes, utilizing a hybrid approach (resampling 1m for 3m crypto charts,
+    and using native exchange endpoints for 15m+).
+"""
+import asyncio
+from datetime import datetime, timedelta
+import pandas as pd
+import requests
+import threading
+import ccxt
+from typing import Dict, Optional, List, Tuple
+
+from app.config import Config
+
+
+class DataManager:
+    """
+    Purpose:
+        Orchestrates data fetching for both Crypto (MEXC) and Forex (OANDA).
+        Dynamically maps user-requested timeframes to exchange-specific granularities.
+    """
+
+    def __init__(self):
+        """
+        Initializes the DataManager, configuring API clients and timeframe mappings.
+        """
+        # Initialize MEXC with rate limiting enabled to prevent IP bans during concurrent fetching
+        self.mexc = ccxt.mexc({'enableRateLimit': True})
+        self.mexc_lock = threading.Lock()
+
+        # Retrieve OANDA credentials from the central configuration
+        self.oanda_key = Config.OANDA_API_KEY
+
+        # Determine the appropriate endpoint based on the selected environment (practice vs. live)
+        domain = "api-fxpractice.oanda.com" if Config.OANDA_ENV == "practice" else "api-fxtrade.oanda.com"
+        self.oanda_url = f"https://{domain}/v3/instruments"
+
+        # Pre-configure headers required for OANDA API authentication
+        self.oanda_headers = {
+            "Authorization": f"Bearer {self.oanda_key}",
+            "Accept-Datetime-Format": "UNIX"  # Enforce UNIX timestamps to streamline Pandas conversion
+        }
+
+        # --- TIMEFRAME TRANSLATORS ---
+        # Maps standard bot timeframes to OANDA's specific granularity string formats
+        self.oanda_tf_map = {
+            '3m': 'M3',
+            '15m': 'M15',
+            '1h': 'H1',
+            '4h': 'H4',
+            '1d': 'D'
+        }
+
+    def _fetch_mexc_sync(self, symbol: str, timeframe: str, limit: int) -> Optional[pd.DataFrame]:
+        """
+        Purpose:
+            Fetches timeframe candles from MEXC synchronously.
+            Uses a hybrid approach: Resamples 1m data for bulletproof 3m charts,
+            but uses native exchange endpoints for higher timeframes to save memory.
+
+        Args:
+            symbol (str): The trading pair (e.g., 'BTC/USDT').
+            timeframe (str): The requested timeframe (e.g., '3m', '15m').
+            limit (int): The number of final candles to retrieve.
+
+        Returns:
+            Optional[pd.DataFrame]: A DataFrame containing the OHLCV data, or None if failed.
+
+        Example:
+            df = manager._fetch_mexc_sync('BTC/USDT', '3m', 150)
+        """
+        try:
+            # --- HYBRID LOGIC: Manual Resampling for 3-minute charts ---
+            if timeframe == '3m':
+                # Fetch 3x the limit in 1-minute candles to ensure we have enough data to build the 3m blocks
+                # Lock the socket so threads don't collide
+                with self.mexc_lock:
+                    candles = self.mexc.fetch_ohlcv(symbol, timeframe='1m', limit=limit * 3)
+
+                if not candles:
+                    print(f"⚠️ MEXC returned no data for {symbol} on 1m (for 3m resample)")
+                    return None
+
+                # Load raw 1-minute data into a Pandas DataFrame
+                df = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+                df.set_index('timestamp', inplace=True)
+
+                # Guard against empty DataFrames before attempting to resample to avoid Pandas errors
+                if df.empty:
+                    return None
+
+                # Mathematically construct the 3-minute blocks using aggregation rules
+                resampled_df = df.resample('3min').agg({
+                    'open': 'first',  # The open of the first 1m candle
+                    'high': 'max',    # The highest high of the three 1m candles
+                    'low': 'min',     # The lowest low of the three 1m candles
+                    'close': 'last',  # The close of the final 1m candle
+                    'volume': 'sum'   # The total volume across the three 1m candles
+                })
+
+                # Drop any incomplete rows (e.g., if we fetch mid-minute)
+                resampled_df.dropna(inplace=True)
+                return resampled_df
+
+            # --- HYBRID LOGIC: Native Fetching for 15m, 1h, 4h, 1d ---
+            else:
+                # Rely on the exchange's native aggregation for higher timeframes to minimize payload size
+                with self.mexc_lock:
+                    candles = self.mexc.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+
+                if not candles:
+                    print(f"⚠️ MEXC returned no data for {symbol} on {timeframe}")
+                    return None
+
+                # Parse directly into a DataFrame
+                df = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+                df.set_index('timestamp', inplace=True)
+                return df
+
+        # Catch specific CCXT errors to differentiate between network failures and exchange rejections
+        except ccxt.NetworkError as e:
+            print(f"❌ Network Error fetching Crypto ({symbol} @ {timeframe}): {e}")
+            return None
+        except ccxt.ExchangeError as e:
+            print(f"❌ Exchange Error fetching Crypto ({symbol} @ {timeframe}): {e}")
+            return None
+        except Exception as e:
+            print(f"❌ Unexpected Error fetching Crypto ({symbol} @ {timeframe}): {e}")
+            return None
+
+    async def fetch_mexc_crypto(self, symbol: str, timeframe: str = '3m', limit: int = 10) -> Optional[pd.DataFrame]:
+        """
+        Purpose:
+            Wraps the synchronous MEXC request in an asyncio thread to prevent blocking the event loop.
+
+        Args:
+            symbol (str): The trading pair (e.g., 'BTC/USDT').
+            timeframe (str, optional): The requested timeframe. Defaults to '3m'.
+            limit (int, optional): The number of candles to retrieve. Defaults to 10.
+
+        Returns:
+            Optional[pd.DataFrame]: The resulting OHLCV DataFrame.
+        """
+        return await asyncio.to_thread(self._fetch_mexc_sync, symbol, timeframe, limit)
+
+    def _fetch_oanda_sync(self, symbol: str, timeframe: str, limit: int) -> Optional[pd.DataFrame]:
+        """
+        Purpose:
+            Translates the timeframe and fetches native candles from OANDA synchronously.
+            OANDA natively supports M3, so no manual resampling is required here.
+
+        Args:
+            symbol (str): The forex instrument (e.g., 'EUR_USD').
+            timeframe (str): The standard bot timeframe (e.g., '3m', '15m').
+            limit (int): The number of candles to retrieve.
+
+        Returns:
+            Optional[pd.DataFrame]: A DataFrame containing the OHLCV data, or None if failed.
+
+        Example:
+            df = manager._fetch_oanda_sync('EUR_USD', '15m', 150)
+        """
+        try:
+            # Map the standard timeframe to OANDA's required format, defaulting to 'M3'
+            oanda_granularity = self.oanda_tf_map.get(timeframe, 'M3')
+
+            # Construct the REST API endpoint URL
+            url = f"{self.oanda_url}/{symbol}/candles?granularity={oanda_granularity}&count={limit}"
+
+            # Execute the GET request with a 10-second timeout to prevent hanging
+            response = requests.get(url, headers=self.oanda_headers, timeout=10)
+            response.raise_for_status()
+
+            data = response.json()
+
+            # Validate that the expected 'candles' payload exists
+            if 'candles' not in data or not data['candles']:
+                print(f"⚠️ OANDA returned no candle data for {symbol} on {timeframe}")
+                return None
+
+            parsed_data = []
+            # Iterate through the JSON response and extract the midpoint ('mid') prices
+            for candle in data['candles']:
+                parsed_data.append({
+                    'timestamp': float(candle['time']) * 1000,  # Convert seconds to milliseconds
+                    'open': float(candle['mid']['o']),
+                    'high': float(candle['mid']['h']),
+                    'low': float(candle['mid']['l']),
+                    'close': float(candle['mid']['c']),
+                    'volume': float(candle['volume'])
+                })
+
+            # Convert the list of dictionaries into a Pandas DataFrame
+            df = pd.DataFrame(parsed_data)
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            df.set_index('timestamp', inplace=True)
+            return df
+
+        # Catch specific HTTP errors (e.g., 401 Unauthorized, 404 Not Found)
+        except requests.exceptions.RequestException as e:
+            print(f"❌ HTTP Error fetching Forex ({symbol} @ {timeframe}): {e}")
+            return None
+        except Exception as e:
+            print(f"❌ Unexpected Error fetching Forex ({symbol} @ {timeframe}): {e}")
+            return None
+
+    async def fetch_oanda_forex(self, symbol: str, timeframe: str = '3m', limit: int = 5) -> Optional[pd.DataFrame]:
+        """
+        Purpose:
+            Wraps the synchronous OANDA request in an asyncio thread to prevent blocking the event loop.
+
+        Args:
+            symbol (str): The forex instrument (e.g., 'US30_USD').
+            timeframe (str, optional): The standard bot timeframe. Defaults to '3m'.
+            limit (int, optional): The number of candles to retrieve. Defaults to 5.
+
+        Returns:
+            Optional[pd.DataFrame]: The resulting OHLCV DataFrame.
+        """
+        return await asyncio.to_thread(self._fetch_oanda_sync, symbol, timeframe, limit)
+
+    async def fetch_all_markets(self, fetch_requests: List[Tuple[str, str, str, str]], limit: int = 5) -> Dict[str, pd.DataFrame]:
+        """
+        Purpose:
+            Fires off all data requests simultaneously based on specific timeframe tasks.
+
+        Args:
+            fetch_requests (List[Tuple[str, str, str, str]]): A list of tuples containing
+                (composite_key, symbol, market_type, timeframe).
+            limit (int, optional): The number of candles to retrieve per request. Defaults to 5.
+
+        Returns:
+            Dict[str, pd.DataFrame]: A dictionary mapping composite keys to their respective DataFrames.
+
+        Example:
+            requests = [("BTC/USDT:15m", "BTC/USDT", "crypto", "15m")]
+            results = await manager.fetch_all_markets(requests, limit=150)
+        """
+        results = {}
+        tasks = []
+
+        # Determine if any crypto requests exist to handle lazy-loading of markets
+        has_crypto = any(req[2] == 'crypto' for req in fetch_requests)
+
+        # Lazy-load MEXC markets in a background thread to prevent collisions during concurrent fetching
+        if has_crypto and not self.mexc.markets:
+            print("[*] Lazy-loading MEXC market data to prevent thread collisions...")
+            await asyncio.to_thread(self.mexc.load_markets)
+
+        # 1. Queue all asynchronous fetch tasks based on market type
+        for composite_key, symbol, market_type, timeframe in fetch_requests:
+            if market_type == 'crypto':
+                tasks.append(self.fetch_mexc_crypto(symbol, timeframe, limit))
+            elif market_type == 'forex':
+                tasks.append(self.fetch_oanda_forex(symbol, timeframe, limit))
+
+        # 2. Execute all tasks concurrently using asyncio.gather
+        print(f"[*] Fetching {len(tasks)} independent timeframe arrays concurrently...")
+        completed_data = await asyncio.gather(*tasks)
+
+        # 3. Map the results strictly back to their COMPOSITE KEYS (e.g., "BTC/USDT:15m")
+        # We iterate through the original requests and the ordered results simultaneously
+        for request_data, dataframe in zip(fetch_requests, completed_data):
+            composite_key = request_data[0]
+            if dataframe is not None:
+                results[composite_key] = dataframe
+
+        return results
+
+    async def close_connections(self):
+        """
+        Purpose:
+            Maintains compatibility with async context managers or shutdown routines.
+            No active sockets need closing since we use synchronous HTTP under the hood.
+        """
+        pass
+
+
+class SyncScheduler:
+    """
+    Purpose:
+        Calculates the exact number of seconds until the next N-minute boundary.
+        Remains untouched, natively supporting the global 3-minute heartbeat or other intervals.
+    """
+
+    @staticmethod
+    async def sleep_until_next_candle(interval_minutes: int = 3):
+        """
+        Purpose:
+            Pauses the execution until the clock reaches the next interval boundary.
+
+        Args:
+            interval_minutes (int, optional): The minute boundary to sync to. Defaults to 3.
+
+        Example:
+            await SyncScheduler.sleep_until_next_candle(interval_minutes=15)
+        """
+        now = datetime.utcnow()
+
+        # Calculate the current minute within the hour
+        current_minute = now.minute
+
+        # Determine the next multiple of the interval_minutes
+        next_minute_boundary = ((current_minute // interval_minutes) + 1) * interval_minutes
+
+        # Construct the exact datetime object for the target wake-up time
+        # We add a 2-second delay (second=2) to allow exchanges to finalize their candle data
+        target_time = now.replace(minute=0, second=2, microsecond=0) + timedelta(minutes=next_minute_boundary)
+
+        # Calculate the precise number of seconds remaining
+        sleep_seconds = (target_time - now).total_seconds()
+
+        print(f"[⏰] Clock Sync: Sleeping for {sleep_seconds:.1f} seconds. Waking up at {target_time.strftime('%H:%M:%S')} UTC...")
+
+        # Yield control back to the event loop until the sleep completes
+        await asyncio.sleep(sleep_seconds)
+</file>
+
+<file path="app/structure.py">
+"""
+Purpose:
+    Implements the "NeuroTrader" Hierarchical Market Structure logic.
+    - Level 0: Directional Change (Filters raw candle noise using ATR).
+    - Level 1 & 2: Hierarchical Structure (Identifies Swing Highs/Lows and enforces Top/Bottom alternation).
+"""
+from typing import Optional, List, Tuple
+from dataclasses import dataclass
+
+
+@dataclass
+class Pivot:
+    """
+    Purpose:
+        A pure data structure representing a confirmed turning point in the market.
+    """
+    price: float
+    timestamp: any
+    type: int  # 1 for Top (High), -1 for Bottom (Low)
+    level: int  # 0 for Base, 1 for Minor Structure, 2 for Major Structure
+
+
+class DirectionalChange:
+    """
+    Purpose:
+        Level 0 Logic. Finds the alternating baseline tops and bottoms using volatility (ATR).
+        It establishes the base 'ZigZag' that higher levels will evaluate.
+    """
+
+    def __init__(self):
+        self.direction = 0  # 0 = Undefined, 1 = Upward (Seeking Top), -1 = Downward (Seeking Bottom)
+        self.pending_high = float('-inf')
+        self.pending_high_time = None
+        self.pending_low = float('inf')
+        self.pending_low_time = None
+
+    def process_candle(self, high: float, low: float, timestamp: any, atr: float) -> Optional[Pivot]:
+        """
+        Purpose:
+            Evaluates a single candle to see if a Level 0 Pivot is confirmed via ATR pullback.
+        """
+        try:
+            # Initialization: Set baseline on the very first candle
+            if self.direction == 0:
+                self.pending_high, self.pending_high_time = high, timestamp
+                self.pending_low, self.pending_low_time = low, timestamp
+                self.direction = 1
+                return None
+
+            # Upward Trend: Looking for a Top
+            if self.direction == 1:
+                # Keep tracking the highest point
+                if high > self.pending_high:
+                    self.pending_high, self.pending_high_time = high, timestamp
+
+                # Check for pullback greater than the ATR threshold
+                elif low < (self.pending_high - atr):
+                    top = Pivot(price=self.pending_high, timestamp=self.pending_high_time, type=1, level=0)
+                    self.direction = -1  # Switch to looking for a bottom
+                    self.pending_low, self.pending_low_time = low, timestamp
+                    return top
+
+            # Downward Trend: Looking for a Bottom
+            elif self.direction == -1:
+                # Keep tracking the lowest point
+                if low < self.pending_low:
+                    self.pending_low, self.pending_low_time = low, timestamp
+
+                # Check for bounce greater than the ATR threshold
+                elif high > (self.pending_low + atr):
+                    bottom = Pivot(price=self.pending_low, timestamp=self.pending_low_time, type=-1, level=0)
+                    self.direction = 1  # Switch to looking for a top
+                    self.pending_high, self.pending_high_time = high, timestamp
+                    return bottom
+
+            return None
+
+        except Exception as e:
+            print(f"Error processing Directional Change L0: {e}")
+            return None
+
+
+class HierarchicalStructure:
+    """
+    Purpose:
+        Level 1 and Level 2 Logic. Upgrades lower-level pivots using the "Neighbor Comparison"
+        method while strictly enforcing the rule that Tops and Bottoms must alternate.
+    """
+
+    def __init__(self, target_level: int):
+        self.target_level = target_level
+        self.lower_tops: List[Pivot] = []
+        self.lower_bottoms: List[Pivot] = []
+        self.confirmed_pivots: List[Pivot] = []  # Tracks the final output to enforce alternation
+
+    def process_lower_pivot(self, pivot: Pivot) -> List[Pivot]:
+        """
+        Purpose:
+            Takes a confirmed lower-level pivot and checks if it forms a valid higher-level structure.
+            Returns a list because enforcing alternation might require plotting two points at once.
+        """
+        new_pivots = []
+
+        try:
+            # --- EVALUATE TOPS ---
+            if pivot.type == 1:
+                self.lower_tops.append(pivot)
+
+                # We need at least 3 tops to compare the middle against the left and right
+                if len(self.lower_tops) >= 3:
+                    left, middle, right = self.lower_tops[-3], self.lower_tops[-2], self.lower_tops[-1]
+
+                    # Neighbor Comparison: Is the middle top higher than its neighbors?
+                    if middle.price > left.price and middle.price > right.price:
+                        candidate = Pivot(middle.price, middle.timestamp, 1, self.target_level)
+
+                        # ALTERNATION CHECK: If the last confirmed pivot was ALSO a Top...
+                        if self.confirmed_pivots and self.confirmed_pivots[-1].type == 1:
+                            last_top_time = self.confirmed_pivots[-1].timestamp
+                            lowest_bot = None
+
+                            # ...we must find the lowest bottom between the two tops to connect them.
+                            for b in self.lower_bottoms:
+                                if last_top_time <= b.timestamp <= candidate.timestamp:
+                                    if lowest_bot is None or b.price < lowest_bot.price:
+                                        lowest_bot = b
+
+                            # Upgrade the missing bottom and add it to our list first
+                            if lowest_bot:
+                                missing_bot = Pivot(lowest_bot.price, lowest_bot.timestamp, -1, self.target_level)
+                                self.confirmed_pivots.append(missing_bot)
+                                new_pivots.append(missing_bot)
+
+                        # Finally, append our candidate Top
+                        self.confirmed_pivots.append(candidate)
+                        new_pivots.append(candidate)
+
+            # --- EVALUATE BOTTOMS ---
+            elif pivot.type == -1:
+                self.lower_bottoms.append(pivot)
+
+                # We need at least 3 bottoms to compare
+                if len(self.lower_bottoms) >= 3:
+                    left, middle, right = self.lower_bottoms[-3], self.lower_bottoms[-2], self.lower_bottoms[-1]
+
+                    # Neighbor Comparison: Is the middle bottom lower than its neighbors?
+                    if middle.price < left.price and middle.price < right.price:
+                        candidate = Pivot(middle.price, middle.timestamp, -1, self.target_level)
+
+                        # ALTERNATION CHECK: If the last confirmed pivot was ALSO a Bottom...
+                        if self.confirmed_pivots and self.confirmed_pivots[-1].type == -1:
+                            last_bot_time = self.confirmed_pivots[-1].timestamp
+                            highest_top = None
+
+                            # ...we must find the highest top between the two bottoms to connect them.
+                            for t in self.lower_tops:
+                                if last_bot_time <= t.timestamp <= candidate.timestamp:
+                                    if highest_top is None or t.price > highest_top.price:
+                                        highest_top = t
+
+                            # Upgrade the missing top and add it to our list first
+                            if highest_top:
+                                missing_top = Pivot(highest_top.price, highest_top.timestamp, 1, self.target_level)
+                                self.confirmed_pivots.append(missing_top)
+                                new_pivots.append(missing_top)
+
+                        # Finally, append our candidate Bottom
+                        self.confirmed_pivots.append(candidate)
+                        new_pivots.append(candidate)
+
+            return new_pivots
+
+        except Exception as e:
+            print(f"Error processing L{self.target_level}: {e}")
+            return []
+
+
+class MarketStructureOrchestrator:
+    """
+    Purpose:
+        The Brain. Passes data through L0, and cascades results up to L1 and L2 sequentially.
+    """
+
+    def __init__(self):
+        self.l0_logic = DirectionalChange()
+        self.l1_logic = HierarchicalStructure(target_level=1)
+        self.l2_logic = HierarchicalStructure(target_level=2)
+
+    def process_candle(self, high: float, low: float, timestamp: any, atr: float) -> Tuple[
+        Optional[Pivot], List[Pivot], List[Pivot]]:
+        """Passes a single candle through the entire hierarchy."""
+        l0_pivot = self.l0_logic.process_candle(high, low, timestamp, atr)
+        l1_pivots = []
+        l2_pivots = []
+
+        if l0_pivot:
+            # If L0 generates a pivot, pass it to L1
+            l1_pivots = self.l1_logic.process_lower_pivot(l0_pivot)
+
+            # If L1 generates any pivots (can be multiple due to alternation fixing), pass them to L2
+            for l1 in l1_pivots:
+                l2_pivots.extend(self.l2_logic.process_lower_pivot(l1))
+
+        return l0_pivot, l1_pivots, l2_pivots
+</file>
+
+<file path="app/visualizer.py">
+"""
+Purpose:
+    Handles the generation of both interactive HTML charts (Plotly) for desktop debugging
+    and lightweight, styled static images (mplfinance) for mobile Telegram alerts.
+"""
+import matplotlib
+matplotlib.use('Agg') # Force headless rendering to prevent thread crashes
+import plotly.graph_objects as go
+import mplfinance as mpf
+import pandas as pd
+from typing import List
+from app.structure import Pivot
+
+class Visualizer:
+    def _extract_line_coordinates(self, pivots: List[Pivot]) -> List[tuple]:
+        """Converts Pivot objects into a list of (timestamp, price) tuples for mplfinance."""
+        sorted_pivots = sorted(pivots, key=lambda x: x.timestamp)
+        return [(p.timestamp, p.price) for p in sorted_pivots]
+
+    def generate_static_chart(self, df: pd.DataFrame, l1_pivots: List[Pivot], l2_pivots: List[Pivot],
+                              save_path: str) -> None:
+        """
+        Generates a lightweight, mobile-responsive static PNG using mplfinance.
+        """
+        try:
+            # 0. Bulletproof the DataFrame format for mplfinance
+            # mplfinance requires Capitalized column names and a strict DatetimeIndex
+            df_plot = df.rename(
+                columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'})
+            df_plot.index = pd.to_datetime(df_plot.index)
+
+            # 1. Build the custom "TradingView" Dark Theme
+            mc = mpf.make_marketcolors(
+                up='#26a69a', down='#ef5350',
+                edge='inherit', wick='inherit', volume='in'
+            )
+            custom_style = mpf.make_mpf_style(
+                marketcolors=mc, gridstyle=':', facecolor='#131722', figcolor='#131722',
+                edgecolor='#49535e', gridcolor='#2b323d',
+                rc={'text.color': 'white', 'axes.labelcolor': 'white', 'xtick.color': 'white', 'ytick.color': 'white'}
+            )
+
+            # 2. Extract and FILTER Pivot Coordinates
+            # FIX: We must drop any pivot coordinates that occurred before our 150-candle window,
+            # otherwise mplfinance crashes trying to plot an off-chart line.
+            min_time = df_plot.index.min()
+            max_time = df_plot.index.max()
+
+            def get_filtered_coords(pivots):
+                # Ensure pivot timestamps are Pandas Timestamps for direct comparison
+                sorted_pivots = sorted(pivots, key=lambda x: pd.to_datetime(x.timestamp))
+                valid_coords = []
+                for p in sorted_pivots:
+                    p_time = pd.to_datetime(p.timestamp)
+                    if min_time <= p_time <= max_time:
+                        valid_coords.append((p_time, p.price))
+                return valid_coords
+
+            l1_coords = get_filtered_coords(l1_pivots)
+            l2_coords = get_filtered_coords(l2_pivots)
+
+            # 3. Compile structure lines
+            seqs = []
+            colors = []
+            widths = []
+
+            # We need at least 2 points to draw a line
+            if len(l1_coords) > 1:
+                seqs.append(l1_coords)
+                colors.append('cyan')
+                widths.append(1.5)
+
+            if len(l2_coords) > 1:
+                seqs.append(l2_coords)
+                colors.append('orange')
+                widths.append(2.5)
+
+            alines_dict = dict(alines=seqs, colors=colors, linewidths=widths) if seqs else None
+
+            # 4. Generate and save the chart
+            mpf.plot(
+                df_plot,
+                type='candle',
+                style=custom_style,
+                alines=alines_dict,
+                volume=False,
+                tight_layout=True,
+                figsize=(10, 6),
+                savefig=save_path
+            )
+        except Exception as e:
+            import traceback
+            print(f"❌ ERROR in Static Visualizer: {e}")
+            traceback.print_exc()  # Added this just in case to print full errors to your console
+
+    def generate_html_chart(self, df: pd.DataFrame, l0_pivots: List[Pivot],
+                       l1_pivots: List[Pivot], l2_pivots: List[Pivot],
+                       save_path: str) -> None:
+        """
+        Purpose:
+            Compiles the OHLC data and Pivot structures into a responsive Plotly chart.
+        """
+        try:
+            l0_sorted = sorted(l0_pivots, key=lambda x: x.timestamp)
+            l1_sorted = sorted(l1_pivots, key=lambda x: x.timestamp)
+            l2_sorted = sorted(l2_pivots, key=lambda x: x.timestamp)
+
+            fig = go.Figure(data=[go.Candlestick(
+                x=df.index,
+                open=df['open'], high=df['high'], low=df['low'], close=df['close'],
+                name='Price'
+            )])
+
+            if l0_sorted:
+                fig.add_trace(go.Scatter(
+                    x=[p.timestamp for p in l0_sorted], y=[p.price for p in l0_sorted],
+                    mode='lines', line=dict(color='gray', width=1.0, dash='dot'), name='Level 0'
+                ))
+
+            if l1_sorted:
+                fig.add_trace(go.Scatter(
+                    x=[p.timestamp for p in l1_sorted], y=[p.price for p in l1_sorted],
+                    mode='lines+markers', line=dict(color='cyan', width=1.5),
+                    marker=dict(size=8, symbol='circle'), name='Level 1'
+                ))
+
+            if l2_sorted:
+                fig.add_trace(go.Scatter(
+                    x=[p.timestamp for p in l2_sorted], y=[p.price for p in l2_sorted],
+                    mode='lines+markers', line=dict(color='orange', width=1.5),
+                    marker=dict(size=4, symbol='circle'), name='Level 2'
+                ))
+
+            fig.update_layout(
+                title="Interactive Structure Debugger",
+                yaxis_title="Price",
+                xaxis_title="Time",
+                template="plotly_dark",
+                xaxis_rangeslider_visible=False
+            )
+
+            fig.write_html(save_path)
+        except Exception as e:
+            print(f"❌ ERROR in HTML Visualizer: {e}")
+</file>
+
+<file path="requirements.txt">
+ccxt>=4.0.0          # Crypto API (Flexible version to get latest exchanges)
+requests>=2.31.0     # Forex API (Twelve Data)
+pandas>=2.0.3        # Data Manipulation
+mplfinance>=0.12.10b0 # Charting
+python-telegram-bot>=20.0 # Notifications
+python-dotenv>=1.0.0 # Config Management
+plotly>=6.5.2 #Charting (Interactive)
+psutil>=5.9.0
+pytest>=8.0.0        # The testing framework
+pytest-asyncio>=0.23.0 # Allows pytest to run your async functions
+</file>
+
+</files>

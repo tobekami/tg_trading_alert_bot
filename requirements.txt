@@ -1,6 +1,10 @@
-ccxt==4.0.0          # Crypto API
-requests==2.31.0     # Forex API (Twelve Data)
-pandas==2.0.3        # Data Manipulation
-mplfinance==0.12.10b0 # Charting
-python-telegram-bot==20.0 # Notifications
-python-dotenv==1.0.0 # Config Management
+ccxt>=4.0.0          # Crypto API (Flexible version to get latest exchanges)
+requests>=2.31.0     # Forex API (Twelve Data)
+pandas>=2.0.3        # Data Manipulation
+mplfinance>=0.12.10b0 # Charting
+python-telegram-bot>=20.0 # Notifications
+python-dotenv>=1.0.0 # Config Management
+plotly>=6.5.2 #Charting (Interactive)
+psutil>=5.9.0
+pytest>=8.0.0        # The testing framework
+pytest-asyncio>=0.23.0 # Allows pytest to run your async functions

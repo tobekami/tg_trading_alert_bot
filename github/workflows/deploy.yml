@@ -1,0 +1,54 @@
+name: Deploy Omni-Market Sentinel
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  # --- STAGE 1: THE GATEKEEPER ---
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Pytest Suite
+        # Inject dummy variables so Config validation passes during automated testing
+        env:
+          OANDA_API_KEY: "ci_dummy_oanda_key"
+          TELEGRAM_BOT_TOKEN: "ci_dummy_bot_token"
+          TELEGRAM_CHAT_ID: "ci_dummy_chat_id"
+        run: |
+          pytest tests/ -v
+
+  # --- STAGE 2: PRODUCTION DEPLOYMENT ---
+  deploy:
+    needs: test # CRITICAL: This job will ONLY run if Stage 1 passes perfectly
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Secure SSH Deployment to Oracle VPS
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            cd ~/tg_trading_alert_bot
+            git pull origin main
+            docker-compose up -d --build
+            docker image prune -f
