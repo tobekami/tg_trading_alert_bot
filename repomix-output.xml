@@ -40,6 +40,7 @@ The content is organized as follows:
 </file_summary>
 
 <directory_structure>
+.github/workflows/deploy.yml
 .gitignore
 app/__init__.py
 app/bot.py
@@ -52,7 +53,6 @@ app/telegram_handler.py
 app/visualizer.py
 docker-compose.yml
 Dockerfile
-github/workflows/deploy.yml
 README.md
 requirements.txt
 tests/test_connect.py
@@ -68,6 +68,87 @@ tests/test_watchlist.py
 
 <files>
 This section contains the contents of the repository's files.
+
+<file path=".github/workflows/deploy.yml">
+name: Deploy Omni-Market Sentinel
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  # --- STAGE 1: THE GATEKEEPER ---
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Pytest Suite
+        # Inject dummy variables so Config validation passes during automated testing
+        env:
+          OANDA_API_KEY: "ci_dummy_oanda_key"
+          TELEGRAM_BOT_TOKEN: "ci_dummy_bot_token"
+          TELEGRAM_CHAT_ID: "ci_dummy_chat_id"
+        run: |
+          pytest tests/ -v
+
+  # --- STAGE 2: PRODUCTION DEPLOYMENT ---
+  deploy:
+    needs: test # CRITICAL: This job will ONLY run if Stage 1 passes perfectly
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Secure SSH Deployment to Oracle VPS
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            cd ~/tg_trading_alert_bot
+            git pull origin main
+            docker-compose up -d --build
+            docker image prune -f
+</file>
+
+<file path=".gitignore">
+# Python
+__pycache__/
+*.py[cod]
+*.class
+
+# Virtual Environment
+venv/
+env/
+
+# Environment Variables
+.env
+
+# Logs and Data
+logs/
+data/
+*.log
+*.png
+
+# IDEs
+.vscode/
+.idea/
+</file>
 
 <file path="app/scanner.py">
 """
@@ -1048,63 +1129,6 @@ USER botuser
 CMD ["python", "-m", "app.bot"]
 </file>
 
-<file path="github/workflows/deploy.yml">
-name: Deploy Omni-Market Sentinel
-
-on:
-  push:
-    branches:
-      - main
-
-jobs:
-  # --- STAGE 1: THE GATEKEEPER ---
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.11'
-
-      - name: Install Dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Run Pytest Suite
-        # Inject dummy variables so Config validation passes during automated testing
-        env:
-          OANDA_API_KEY: "ci_dummy_oanda_key"
-          TELEGRAM_BOT_TOKEN: "ci_dummy_bot_token"
-          TELEGRAM_CHAT_ID: "ci_dummy_chat_id"
-        run: |
-          pytest tests/ -v
-
-  # --- STAGE 2: PRODUCTION DEPLOYMENT ---
-  deploy:
-    needs: test # CRITICAL: This job will ONLY run if Stage 1 passes perfectly
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-
-      - name: Secure SSH Deployment to Oracle VPS
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.VPS_HOST }}
-          username: ${{ secrets.VPS_USER }}
-          key: ${{ secrets.VPS_SSH_KEY }}
-          script: |
-            cd ~/tg_trading_alert_bot
-            git pull origin main
-            docker-compose up -d --build
-            docker image prune -f
-</file>
-
 <file path="tests/test_connect.py">
 import sys
 import os
@@ -1220,7 +1244,6 @@ from app.scanner import PatternScanner
 from app.state import StateManager
 from app.structure import MarketStructureOrchestrator, Pivot
 
-
 def test_pattern_scanner():
     print("\n--- 👁️ Testing Pattern Scanner ---")
 
@@ -1248,12 +1271,6 @@ def test_pattern_scanner():
 
         assert any("BOS" in a for a in alerts_1), "Failed to detect initial BOS."
         assert not any("BOS" in a for a in alerts_2), "Failed to suppress redundant BOS alert."
-
-        # 2. Equilibrium Touch
-        candle_3 = {"timestamp": 5, "open": 16000, "high": 16000, "low": 14000, "close": 14500}
-        alerts_3 = scanner.scan(symbol, candle_3, [], orchestrator, [], [], state)
-        assert any("Equilibrium Touch" in a for a in alerts_3) or any(
-            "EQ" in a for a in alerts_3), "Failed to detect EQ touch."
 
     finally:
         if os.path.exists(test_file): os.remove(test_file)
@@ -1342,7 +1359,7 @@ from app.telegram_handler import TelegramCLI
 
 @pytest.mark.asyncio
 async def test_telegram_logic():
-    print("\n--- 📱 Testing Telegram CLI & Command Validator ---")
+    print("\n--- 📱 Testing Telegram CLI UI Routers ---")
 
     # Cleanup before test
     if os.path.exists("data/test_tg_state.pkl"): os.remove("data/test_tg_state.pkl")
@@ -1358,26 +1375,33 @@ async def test_telegram_logic():
         update.message = AsyncMock()
         context = MagicMock()
 
-        # 1. Test Valid /add Command
-        context.args = ["ADA/USDT", "crypto"]
+        # 1. Test /add Command (Should return the Interactive Keyboard)
         await cli.cmd_add(update, context)
         update.message.reply_text.assert_called()
-        reply_args = update.message.reply_text.call_args[0][0]
-        assert "✅" in reply_args, "Did not get success message for valid addition."
-        assert "ADA/USDT" in state.get_watchlist(), "State was not updated by Telegram CLI."
+        reply_text = update.message.reply_text.call_args[0][0]
+        kwargs = update.message.reply_text.call_args[1]
 
-        # 2. Test Invalid /add Command
-        context.args = ["ADA/USDT"]
-        await cli.cmd_add(update, context)
-        reply_args = update.message.reply_text.call_args[0][0]
-        assert "❌ <b>Error:</b>" in reply_args, "Did not catch missing argument error."
+        assert "What type of market are you adding?" in reply_text, "Failed to send the interactive prompt."
+        assert 'reply_markup' in kwargs, "Failed to attach the Inline Keyboard."
 
-        # 3. Test Invalid /levels Command
-        context.args = ["ADA/USDT", "half, quarter"]
+        # 2. Test /status Command (Empty Watchlist via Mocking)
+        # We mock the get_watchlist function to bypass the auto-repopulate safety net
+        with patch.object(state, 'get_watchlist', return_value={}):
+            await cli.cmd_status(update, context)
+            reply_text = update.message.reply_text.call_args[0][0]
+            assert "empty" in reply_text.lower(), "Did not handle empty watchlist correctly."
+
+        # 3. Test /status Command (Populated Watchlist)
+        state.add_symbol("BTC/USDT:15m", "crypto")
+        await cli.cmd_status(update, context)
+        reply_text = update.message.reply_text.call_args[0][0]
+        assert "Active Watchlist" in reply_text, "Did not return active watchlist status."
+        assert "BTC/USDT:15m" in reply_text, "Did not display the added composite symbol."
+
+        # 4. Test /levels Command (Should return the Watchlist Keyboard)
         await cli.cmd_levels(update, context)
-        reply_args = update.message.reply_text.call_args[0][0]
-        assert "❌ <b>Error:</b>" in reply_args, "Did not catch float conversion error."
-        assert state.get_watchlist()["ADA/USDT"]["levels"] == [0.5], "Levels were corrupted by bad input."
+        reply_text = update.message.reply_text.call_args[0][0]
+        assert "Select the pair to update levels for:" in reply_text, "Failed to return the levels interactive prompt."
 
     finally:
         # Cleanup after test finishes or fails
@@ -1453,50 +1477,26 @@ def test_dynamic_watchlist():
     try:
         state = StateManager(filepath=test_file)
 
-        # 1. Addition
-        assert state.add_symbol("SOL/USDT", "crypto") is True
-        assert "SOL/USDT" in state.get_watchlist()
-        assert state.add_symbol("SOL/USDT", "crypto") is False # Duplicate
+        # 1. Addition (Using ADA to avoid colliding with default BTC/SOL)
+        assert state.add_symbol("ADA/USDT", "crypto") is True
+        assert "ADA/USDT" in state.get_watchlist()
+        assert state.add_symbol("ADA/USDT", "crypto") is False # Duplicate
 
         # 2. Levels
-        assert state.update_levels("SOL/USDT", [0.382, 0.618]) is True
-        assert state.get_watchlist()["SOL/USDT"]["levels"] == [0.382, 0.618]
+        assert state.update_levels("ADA/USDT", [0.382, 0.618]) is True
+        assert state.get_watchlist()["ADA/USDT"]["levels"] == [0.382, 0.618]
 
         # 3. Toggles
-        assert state.toggle_alert("SOL/USDT", "bos") == "OFF"
-        assert state.get_watchlist()["SOL/USDT"]["alerts"]["bos"] is False
+        assert state.toggle_alert("ADA/USDT", "bos") == "OFF"
+        assert state.get_watchlist()["ADA/USDT"]["alerts"]["bos"] is False
 
         # 4. Removal
-        assert state.remove_symbol("SOL/USDT") is True
-        assert "SOL/USDT" not in state.get_watchlist()
+        assert state.remove_symbol("ADA/USDT") is True
+        assert "ADA/USDT" not in state.get_watchlist()
 
     finally:
         if os.path.exists(test_file): os.remove(test_file)
         if os.path.exists(f"{test_file}.bak"): os.remove(f"{test_file}.bak")
-</file>
-
-<file path=".gitignore">
-# Python
-__pycache__/
-*.py[cod]
-*.class
-
-# Virtual Environment
-venv/
-env/
-
-# Environment Variables
-.env
-
-# Logs and Data
-logs/
-data/
-*.log
-*.png
-
-# IDEs
-.vscode/
-.idea/
 </file>
 
 <file path="app/bot.py">

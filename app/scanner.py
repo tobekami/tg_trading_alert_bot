@@ -4,9 +4,12 @@ Purpose:
     Pivot Formations, Break of Structure (BOS), Reversals, and Equilibrium touches.
     Utilizes a Sliding Window to track dynamic breakouts in real-time.
 """
+import logging
 from typing import List, Dict, Optional
 from app.structure import MarketStructureOrchestrator, Pivot
 from app.state import StateManager
+
+logger = logging.getLogger(__name__)
 
 
 class PatternScanner:
@@ -88,8 +91,28 @@ class PatternScanner:
 
                 for struct_name, s_top, s_bot in structures_to_check:
                     # Get the dynamic bounds for this specific structure
-                    range_high, range_low, is_bullish_leg, is_sliding = self._get_active_range(s_top, s_bot, orchestrator, current_candle)
+                    range_high, range_low, is_bullish_leg, is_sliding = self._get_active_range(s_top, s_bot,
+                                                                                               orchestrator,
+                                                                                               current_candle)
                     s_range = range_high - range_low
+
+                    # --- INJECTED DEBUG LOGGING ---
+                    leg_dir = "BULLISH (Bottom->Top)" if is_bullish_leg else "BEARISH (Top->Bottom)"
+                    leg_state = "DYNAMIC" if is_sliding else "STATIC"
+
+                    # Calculate EQ marks for the log
+                    if is_bullish_leg:
+                        eq_50 = range_high - (s_range * 0.5)
+                        eq_75 = range_high - (s_range * 0.75)
+                    else:
+                        eq_50 = range_low + (s_range * 0.5)
+                        eq_75 = range_low + (s_range * 0.75)
+
+                    logger.info(
+                        f"🔍 [DEBUG {symbol} {struct_name}] {leg_dir} | {leg_state} | "
+                        f"Low: {range_low:.4f} -> High: {range_high:.4f} | "
+                        f"50% EQ: {eq_50:.4f} | 75% EQ: {eq_75:.4f}"
+                    )
 
                     for level in active_levels:
                         # Determine target price and expected bounce direction
