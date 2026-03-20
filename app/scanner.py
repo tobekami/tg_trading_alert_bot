@@ -147,6 +147,24 @@ class PatternScanner:
                             ha_cache = self._calculate_ha(candle_cache)
                             is_bullish_bounce = (expected_dir == "Bullish")
 
+                            # --- INJECTED HA DEBUG LOGGING ---
+                            if len(ha_cache) >= 2:
+                                c2, c3 = ha_cache[-2], ha_cache[-1]
+
+                                def ha_desc(c):
+                                    tot = c['high'] - c['low']
+                                    body = abs(c['close'] - c['open'])
+                                    perc = (body / tot * 100) if tot > 0 else 0
+                                    color = "GREEN" if c['close'] > c['open'] else "RED"
+                                    ctype = "DOJI" if perc <= 15.0 else "TREND"
+                                    return f"{color} {ctype} ({perc:.1f}%)"
+
+                                logger.info(
+                                    f"[HA DEBUG {symbol} {active_zone_label}] "
+                                    f"Prev: {ha_desc(c2)} | Latest: {ha_desc(c3)} | "
+                                    f"Expected: {'Bounce UP' if is_bullish_bounce else 'Reject DOWN'}"
+                                )
+
                             if self._check_ha_reversal(ha_cache, is_bullish_pullback=is_bullish_bounce):
                                 dir_icon = "🟢" if is_bullish_bounce else "🔴"
                                 if state_manager.can_alert(symbol, f"HA_{struct_name}_{level}", current_time, cooldown_seconds=900):

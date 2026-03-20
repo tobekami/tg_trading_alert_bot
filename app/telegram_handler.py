@@ -287,9 +287,10 @@ class TelegramCLI:
                     temp_dm = DataManager()
 
                     if m_type == 'crypto':
-                        market_data = await temp_dm.fetch_mexc_crypto(text, timeframe=tf, limit=400)
+                        # BUMPED TO 1000: Ensures 15m/1h timeframes have enough history for L2
+                        market_data = await temp_dm.fetch_mexc_crypto(text, timeframe=tf, limit=1000)
                     else:
-                        market_data = await temp_dm.fetch_oanda_forex(text, timeframe=tf, limit=400)
+                        market_data = await temp_dm.fetch_oanda_forex(text, timeframe=tf, limit=1000)
 
                     if market_data is not None and not market_data.empty:
 

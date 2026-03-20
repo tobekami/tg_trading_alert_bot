@@ -51,14 +51,21 @@ class OmniMarketSentinel:
     async def preload_history(self) -> None:
         """
         Purpose:
-            Fetches 400 historical candles on startup to build accurate L1/L2 structures.
-            Now utilizes the Composite Key architecture (Symbol:Timeframe).
+            Fetches 1000 historical candles on startup for NEW pairs to build accurate structures.
+            Bypasses existing pairs to allow StateManager and trading_loop to handle safe catch-up.
         """
         watchlist = self.state_manager.get_watchlist()
         fetch_requests: List[Tuple[str, str, str, str]] = []
 
         # 1. Build the Composite Fetch Requests
         for composite_key, cfg in watchlist.items():
+            # --- THE FIX: PREVENT MEMORY DESTRUCTION ---
+            # If the symbol already has cached memory, skip it.
+            # The main trading loop's Batch Catch-Up logic will safely handle any offline gaps.
+            if composite_key in self.state_manager.state.get("candle_caches", {}):
+                logger.info(f"⏭️ {composite_key} memory intact. Skipping preload.")
+                continue
+
             # Fallback for old save files that might not have the colon formatting yet
             symbol = composite_key.split(':')[0] if ':' in composite_key else composite_key
             m_type = cfg.get("type", "crypto")
@@ -67,12 +74,13 @@ class OmniMarketSentinel:
             fetch_requests.append((composite_key, symbol, m_type, tf))
 
         if not fetch_requests:
+            logger.info("🧠 Brain Vaults already loaded from disk. Skipping preload.")
             return
 
-        logger.info("⏳ Pre-loading 400 historical candles to build Market Structure...")
+        logger.info("⏳ Pre-loading 1000 historical candles to build Market Structure...")
 
         # 2. Fetch the data using the Phase 4.5 signature
-        market_data = await self.data_manager.fetch_all_markets(fetch_requests, limit=400)
+        market_data = await self.data_manager.fetch_all_markets(fetch_requests, limit=1000)
 
         # 3. Process the historical data per Composite Key
         for composite_key, df in market_data.items():
