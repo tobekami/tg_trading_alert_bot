@@ -7,12 +7,17 @@ Purpose:
 import os
 import pickle
 import shutil
+import logging
 from typing import Dict, List, Any
 from app.structure import MarketStructureOrchestrator
 
+logger = logging.getLogger(__name__)
 
 class StateManager:
     def __init__(self, filepath: str = "data/bot_state.pkl"):
+        """
+        Initializes the state manager and defines the core memory schema.
+        """
         self.filepath = filepath
         self.backup_path = f"{filepath}.bak"
 
@@ -20,13 +25,20 @@ class StateManager:
         self.state = {
             "orchestrators": {},  # type: Dict[str, MarketStructureOrchestrator]
             "candle_caches": {},  # type: Dict[str, List[dict]]
-            "alert_states": {},  # type: Dict[str, float] -> Tracks timestamps for cooldowns
-            "bos_records": {},  # type: Dict[str, Any] -> Tracks processed BOS pivot timestamps
+            "alert_states": {},   # type: Dict[str, float] -> Tracks timestamps for cooldowns
+            "bos_records": {},    # type: Dict[str, Any] -> Tracks processed BOS pivot timestamps
             "pivot_records": {},  # type: Dict[str, Any] -> Tracks announced pivot formations
-            "watchlist": {}
+            "watchlist": {},      # type: Dict[str, Any] -> Dynamic tracking targets
+
+            # --- THE REMOTE DEBUGGER ---
+            # Default state initialization for fresh deployments
+            "debugger": {
+                "status": "OFF",
+                "interval": "15m"
+            }
         }
 
-        # Ensure the data directory exists
+        # Ensure the data directory exists before attempting to load or save
         os.makedirs(os.path.dirname(self.filepath), exist_ok=True)
         self.load_state()
 
@@ -35,32 +47,54 @@ class StateManager:
         Purpose:
             Loads the saved state from disk. If the main file is corrupted,
             it attempts to recover from the backup file.
+            Also handles backward-compatibility for older save files.
         """
         if not os.path.exists(self.filepath):
-            print("[ℹ️] No existing state found. Starting fresh.")
+            logger.info("[ℹ️] No existing state found. Starting fresh.")
             return
 
         try:
             with open(self.filepath, 'rb') as f:
-                self.state = pickle.load(f)
-            print(f"[💾] State loaded successfully from {self.filepath}")
+                loaded_state = pickle.load(f)
+
+            # Safely merge loaded state to preserve defaults for newly added keys
+            for key, value in loaded_state.items():
+                self.state[key] = value
+
+            # --- BACKWARD COMPATIBILITY CHECK ---
+            # If an old bot_state.pkl was loaded, it will overwrite the schema and might
+            # be missing the "debugger" key. We must inject it safely here.
+            if "debugger" not in self.state:
+                self.state["debugger"] = {"status": "OFF", "interval": "15m"}
+                logger.info("[⚙️] Upgraded existing state file with Remote Debugger schema.")
+
+            logger.info(f"[💾] State loaded successfully from {self.filepath}")
+
         except (EOFError, pickle.UnpicklingError) as e:
-            print(f"⚠️ Primary state file corrupted ({e}). Attempting to load backup...")
+            logger.warning(f"⚠️ Primary state file corrupted ({e}). Attempting to load backup...")
             if os.path.exists(self.backup_path):
                 try:
                     with open(self.backup_path, 'rb') as f:
-                        self.state = pickle.load(f)
-                    print(f"[💾] Backup state loaded successfully.")
+                        loaded_state = pickle.load(f)
+
+                    # Apply the same safe merge and backward compatibility to the backup
+                    for key, value in loaded_state.items():
+                        self.state[key] = value
+
+                    if "debugger" not in self.state:
+                        self.state["debugger"] = {"status": "OFF", "interval": "15m"}
+
+                    logger.info(f"[💾] Backup state loaded successfully.")
                 except Exception as backup_error:
-                    print(f"❌ Backup also corrupted ({backup_error}). Starting fresh.")
+                    logger.error(f"❌ Backup also corrupted ({backup_error}). Starting fresh.")
             else:
-                print("❌ No backup found. Starting fresh.")
+                logger.error("❌ No backup found. Starting fresh.")
 
     def save_state(self) -> None:
         """
         Purpose:
             Safely pickles the current memory to the disk. Creates a backup of the
-            old state before overwriting, preventing data loss if interrupted.
+            old state before overwriting, preventing data loss if interrupted during write.
         """
         try:
             # Create a backup of the existing file before overwriting
@@ -70,7 +104,7 @@ class StateManager:
             with open(self.filepath, 'wb') as f:
                 pickle.dump(self.state, f)
         except Exception as e:
-            print(f"❌ Critical error saving state: {e}")
+            logger.error(f"❌ Critical error saving state: {e}")
 
     def get_orchestrator(self, symbol: str) -> MarketStructureOrchestrator:
         """Retrieves or initializes the Orchestrator for a specific symbol."""
@@ -90,7 +124,7 @@ class StateManager:
         cache = self.state["candle_caches"][symbol]
         cache.append(new_candle)
 
-        # 150/50 Wipe Logic
+        # 150/50 Wipe Logic to maintain optimal memory footprint
         if len(cache) > 150:
             self.state["candle_caches"][symbol] = cache[-101:]
 
@@ -105,7 +139,7 @@ class StateManager:
         key = f"{symbol}_{alert_type}"
         last_alert_time = self.state["alert_states"].get(key, 0)
 
-        # FIX: Always allow if it has never alerted before (0), OR if the cooldown has passed.
+        # Always allow if it has never alerted before (0), OR if the cooldown has passed.
         if last_alert_time == 0 or (current_time - last_alert_time) >= cooldown_seconds:
             self.state["alert_states"][key] = current_time
             return True
@@ -125,7 +159,6 @@ class StateManager:
 
     def has_pivot_triggered(self, symbol: str, level: str, pivot_timestamp: float) -> bool:
         """Checks if a Pivot Formation has already been announced for a specific timestamp."""
-        # Gracefully handle older state files that might not have this key yet
         if "pivot_records" not in self.state:
             self.state["pivot_records"] = {}
 
@@ -144,40 +177,44 @@ class StateManager:
 
         self.state["pivot_records"][symbol][level] = pivot_timestamp
 
-    # --- Add these to your StateManager __init__ inside self.state ---
     def get_watchlist(self) -> Dict[str, Any]:
-        """Returns the current dynamic watchlist."""
-        # Provide a default if it's completely empty on first boot
+        """
+        Returns the current dynamic watchlist.
+        Provides a default starter list if completely empty on first boot.
+        """
         if "watchlist" not in self.state or not self.state["watchlist"]:
             self.state["watchlist"] = {
-                "BTC/USDT": {"type": "crypto", "levels": [0.5, 0.75],
+                "BTC/USDT:15m": {"type": "crypto", "timeframe": "15m", "levels": [0.5, 0.75],
                              "alerts": {"bos": True, "reversal": True, "pivot": False}},
-                "SOL/USDT": {"type": "crypto", "levels": [0.5, 0.75],
-                             "alerts": {"bos": True, "reversal": True, "pivot": True}},
-                "US30_USD": {"type": "forex", "levels": [0.5, 0.75],
-                             "alerts": {"bos": True, "reversal": False, "pivot": True}}
+                "SOL/USDT:15m": {"type": "crypto", "timeframe": "15m", "levels": [0.5, 0.75],
+                             "alerts": {"bos": True, "reversal": True, "pivot": True}}
             }
         return self.state["watchlist"]
 
     def add_symbol(self, symbol: str, market_type: str) -> bool:
-        """Adds a new symbol with default tracking settings."""
+        """Adds a new composite symbol with default tracking settings."""
         watchlist = self.get_watchlist()
         if symbol in watchlist:
             return False  # Already exists
 
         watchlist[symbol] = {
             "type": market_type,
-            "levels": [0.5],
+            "levels": [0.5, 0.75],
             "alerts": {"bos": True, "reversal": True, "pivot": False}
         }
         self.save_state()
         return True
 
     def remove_symbol(self, symbol: str) -> bool:
-        """Removes a symbol from the active scanner."""
+        """Removes a symbol from the active scanner and deletes its memory cache."""
         watchlist = self.get_watchlist()
         if symbol in watchlist:
             del watchlist[symbol]
+
+            # Clean up associated memory to prevent vault bloat
+            self.state["orchestrators"].pop(symbol, None)
+            self.state["candle_caches"].pop(symbol, None)
+
             self.save_state()
             return True
         return False

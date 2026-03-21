@@ -54,6 +54,7 @@ class TelegramCLI:
         self.app.add_handler(CommandHandler("toggle", self.cmd_toggle))
         self.app.add_handler(CommandHandler("chart", self.cmd_chart))
         self.app.add_handler(CommandHandler("stats", self.cmd_stats))
+        self.app.add_handler(CommandHandler("logs", self.cmd_logs))
 
         # Interactive UI Routers (Button Clicks)
         self.app.add_handler(CallbackQueryHandler(self.handle_button_click))
@@ -175,6 +176,31 @@ class TelegramCLI:
             logger.error(f"Error fetching stats: {e}")
             await update.message.reply_text("❌ Failed to retrieve system diagnostics.")
 
+    async def cmd_logs(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Initiates the Remote Debugger configuration flow.
+        Displays current status and provides interactive toggles.
+        """
+        try:
+            # Safely fetch current state, defaulting to OFF and 15m
+            debugger_state = self.state_manager.state.get("debugger", {})
+            status = debugger_state.get("status", "OFF")
+            interval = debugger_state.get("interval", "15m")
+
+            msg = (f"🛠️ <b>Remote Debugger Configuration</b>\n"
+                   f"Status: <b>{status}</b> | Interval: <b>{interval}</b>\n\n"
+                   f"Select an action:")
+
+            # Build the interactive toggle buttons
+            keyboard = [
+                [InlineKeyboardButton("🟢 Turn ON", callback_data="debug_toggle|ON"),
+                 InlineKeyboardButton("🔴 Turn OFF", callback_data="debug_toggle|OFF")]
+            ]
+            await update.message.reply_text(msg, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(keyboard))
+        except Exception as e:
+            logger.error(f"Error executing /logs command: {e}")
+            await update.message.reply_text("❌ Failed to open debugger menu.")
+
 
     # --- THE BUTTON ROUTER ---
     async def handle_button_click(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -248,6 +274,45 @@ class TelegramCLI:
                 symbol = data[1]
                 await query.message.delete() # Remove the menu to keep chat clean
                 await self._execute_chart(update.effective_message, symbol)
+
+            # --- REMOTE DEBUGGER: ON/OFF Toggle ---
+            elif action == "debug_toggle":
+                target_state = data[1]
+
+                if target_state == "OFF":
+                    # If OFF, save immediately and confirm
+                    if "debugger" not in self.state_manager.state:
+                        self.state_manager.state["debugger"] = {}
+                    self.state_manager.state["debugger"]["status"] = "OFF"
+                    self.state_manager.save_state()
+
+                    await query.edit_message_text("🛠️ <b>Remote Debugger</b> is now <b>OFF</b>.", parse_mode='HTML')
+                else:
+                    # If ON, ask for the snapshot interval
+                    keyboard = [
+                        [InlineKeyboardButton("3 min", callback_data="debug_tf|3m"),
+                         InlineKeyboardButton("15 min", callback_data="debug_tf|15m")],
+                        [InlineKeyboardButton("1 Hour", callback_data="debug_tf|1h"),
+                         InlineKeyboardButton("4 Hour", callback_data="debug_tf|4h")]
+                    ]
+                    await query.edit_message_text("Select the snapshot interval:",
+                                                  reply_markup=InlineKeyboardMarkup(keyboard))
+
+            # --- REMOTE DEBUGGER: Interval Selection ---
+            elif action == "debug_tf":
+                interval = data[1]
+
+                # Ensure the dictionary exists before writing
+                if "debugger" not in self.state_manager.state:
+                    self.state_manager.state["debugger"] = {}
+
+                self.state_manager.state["debugger"]["status"] = "ON"
+                self.state_manager.state["debugger"]["interval"] = interval
+                self.state_manager.save_state()
+
+                await query.edit_message_text(
+                    f"🛠️ <b>Remote Debugger</b> is now <b>ON</b>.\nSnapshot Interval: <b>{interval}</b>.",
+                    parse_mode='HTML')
 
         except Exception as e:
             logger.error(f"Error handling button click: {e}")
