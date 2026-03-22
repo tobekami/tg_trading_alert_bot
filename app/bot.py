@@ -177,7 +177,11 @@ class OmniMarketSentinel:
 
                 for level in active_levels:
                     target_price = range_high - (s_range * level) if is_bull else range_low + (s_range * level)
-                    expected_dir = "Bearish" if level == 0.0 else "Bullish" if is_bull else "Bullish" if level == 0.0 else "Bearish"
+
+                    if is_bull:
+                        expected_dir = "Bearish" if level == 0.0 else "Bullish"
+                    else:
+                        expected_dir = "Bullish" if level == 0.0 else "Bearish"
 
                     if scanner._is_in_killzone(current_candle, target_price, current_atr):
                         in_killzone = True

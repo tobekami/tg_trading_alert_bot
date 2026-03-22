@@ -217,37 +217,61 @@ class PatternScanner:
             Tuple[float, float, bool, bool]: (range_high, range_low, is_bullish_leg, is_sliding)
         """
         try:
-            # Scan L0 minor swings for absolute extremes since the confirmed pivots
+            # 1. Find the absolute Highest Point and WHEN it happened
             max_high = current_candle['high']
+            max_high_time = current_candle['timestamp']
+
             for p in orchestrator.l1_logic.lower_tops:
                 if p.timestamp >= last_bot.timestamp and p.price > max_high:
                     max_high = p.price
+                    max_high_time = p.timestamp
 
+            # 2. Find the absolute Lowest Point and WHEN it happened
             min_low = current_candle['low']
+            min_low_time = current_candle['timestamp']
+
             for p in orchestrator.l1_logic.lower_bottoms:
                 if p.timestamp >= last_top.timestamp and p.price < min_low:
                     min_low = p.price
+                    min_low_time = p.timestamp
 
-            # Determine leg direction based on timestamp chronology
+            # 3. Determine which boundaries have been crossed
+            is_high_broken = max_high > last_top.price
+            is_low_broken = min_low < last_bot.price
+
+            # 4. Evaluate based on Leg Direction and Chronology
             if last_top.timestamp > last_bot.timestamp:
                 # Sequence: Bottom -> Top (Upward Leg)
-                if max_high > last_top.price:
+                if is_high_broken and is_low_broken:
+                    # BOTH broken: The most recent event dictates the trend
+                    if min_low_time > max_high_time:
+                        return (last_top.price, min_low, False, True)  # Reversal Sliding DOWN
+                    else:
+                        return (max_high, last_bot.price, True, True)  # Sliding UP
+                elif is_high_broken:
                     return (max_high, last_bot.price, True, True)  # Sliding UP
-                elif min_low < last_bot.price:
+                elif is_low_broken:
                     return (last_top.price, min_low, False, True)  # Reversal Sliding DOWN
                 else:
                     return (last_top.price, last_bot.price, True, False)  # Static
             else:
                 # Sequence: Top -> Bottom (Downward Leg)
-                if min_low < last_bot.price:
+                if is_high_broken and is_low_broken:
+                    # BOTH broken: The most recent event dictates the trend
+                    if max_high_time > min_low_time:
+                        return (max_high, last_bot.price, True, True)  # Reversal Sliding UP
+                    else:
+                        return (last_top.price, min_low, False, True)  # Sliding DOWN
+                elif is_low_broken:
                     return (last_top.price, min_low, False, True)  # Sliding DOWN
-                elif max_high > last_top.price:
+                elif is_high_broken:
                     return (max_high, last_bot.price, True, True)  # Reversal Sliding UP
                 else:
                     return (last_top.price, last_bot.price, False, False)  # Static
+
         except Exception as e:
             logger.error(f"Error calculating active range: {e}")
-            return (last_top.price, last_bot.price, True, False) # Fallback to static
+            return (last_top.price, last_bot.price, True, False)  # Fallback to static
 
     def _get_last_pivot(self, pivots: List[Pivot], type: int) -> Optional[Pivot]:
         """
